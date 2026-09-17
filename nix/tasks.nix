@@ -953,6 +953,10 @@ in
       export YAS_FONT_DIRS="${pkgs.dejavu_fonts}/share/fonts/truetype"
       ${softwareVulkanEnv}
 
+      echo "=== Installer tests ==="
+      node --test bin/install.test.mjs
+      echo ""
+
       # Rust tests exercise the UI routes, so their include_bytes! inputs must
       # be valid Brotli streams with representative content. Building the
       # production UI here would realize the browser WASM and pnpm closures

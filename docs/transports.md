@@ -404,8 +404,10 @@ The remote socket path is resolved on the remote host using the standard cascade
 the same ownership, mode, symlink, socket-owner, and portable-length checks. It
 also accepts the secure packaged-system socket `/run/yas/$USER-$NAME.sock` when
 `/run/yas` is root-owned and non-writable. An explicit remote `YAS_SOCK` remains
-exact. If yas is not installed on the remote, it is auto-installed to
-`~/.local/bin`. If an automatic server is not running, startup lets that server
+exact. If YAS is not installed on the remote, it is auto-installed to
+`~/.local/bin` as the SSH user. Home-directory installs never retry with sudo or
+doas; if the destination is not writable, fix its ownership or permissions and
+reconnect. If an automatic server is not running, startup lets that server
 resolve its path again instead of freezing the predicted candidate into an
 explicit override. Connection retries with back-off handle the startup window.
 

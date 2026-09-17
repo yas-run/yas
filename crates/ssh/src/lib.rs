@@ -95,8 +95,8 @@ fn install_and_start_script_for(socket_path: &str, explicit_socket: bool) -> Str
     let script = format!(
         "export PATH=\"$HOME/.local/bin:$PATH\"; \
          if ! command -v yas >/dev/null 2>&1; then \
-           if command -v curl >/dev/null 2>&1; then YAS_PREFIX=\"$HOME/.local\" curl -sf https://yas.run | sh >&2; \
-           elif command -v wget >/dev/null 2>&1; then YAS_PREFIX=\"$HOME/.local\" wget -qO- https://yas.run | sh >&2; fi; \
+           if command -v curl >/dev/null 2>&1; then curl -sf https://yas.run | YAS_PREFIX=\"$HOME/.local\" sh >&2; \
+           elif command -v wget >/dev/null 2>&1; then wget -qO- https://yas.run | YAS_PREFIX=\"$HOME/.local\" sh >&2; fi; \
          fi; \
          S=\"{escaped}\"; \
          if [ -S \"$S\" ]; then \
@@ -845,6 +845,54 @@ mod tests {
         assert!(script.starts_with("sh -c '"));
         assert!(script.contains("owner'\"'\"'s-\\$(touch nope).sock"));
         assert!(script.contains("YAS_SOCK=\"$S\" nohup yas server"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_install_passes_local_prefix_to_the_installer() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("yas-ssh-install-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        symlink("/bin/sh", dir.join("sh")).unwrap();
+        let home = dir.join("owner's home");
+        let prefix_file = dir.join("prefix");
+
+        for downloader in ["curl", "wget"] {
+            let path = dir.join(downloader);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s\\n' 'printf %s \"$YAS_PREFIX\" > \"$TEST_PREFIX_FILE\"'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &install_and_start_script_for(dir.join("absent.sock").to_str().unwrap(), false),
+                ])
+                .env("PATH", &dir)
+                .env("HOME", &home)
+                .env("YAS_PREFIX", "/unexpected/system/prefix")
+                .env("TEST_PREFIX_FILE", &prefix_file)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            assert_eq!(
+                std::fs::read_to_string(&prefix_file).unwrap(),
+                home.join(".local").to_str().unwrap(),
+                "{downloader} bootstrap must override the installer's inherited prefix"
+            );
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(&prefix_file).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn key(s: &str) -> keys::PublicKey {

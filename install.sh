@@ -124,6 +124,12 @@ main() {
   if install_bin "" 2>/dev/null; then
     :
   elif [ "$(id -u)" != "0" ]; then
+    # A personal install must stay owned by the invoking user. In particular,
+    # SSH bootstrap must not silently turn a permissions problem into a
+    # root-owned binary (and root-generated completions) inside their home.
+    case "$PREFIX/" in
+      "$HOME/"*) err "cannot write to $PREFIX/bin; fix its ownership or permissions before installing in your home directory" ;;
+    esac
     elevate=$(pick_elevate)
     echo "elevation required, retrying with $elevate..."
     install_bin "$elevate" || err "installation failed"
