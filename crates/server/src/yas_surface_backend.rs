@@ -171,6 +171,7 @@ impl Sink {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ViewConfig {
+    pub(crate) direct_touch: bool,
     pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) max_fps: u16,
@@ -574,7 +575,7 @@ fn hidden_client(
         surface_color_capabilities: config.color_capabilities,
         surface_max_decode: (config.width, config.height),
         pressed_surface_keys: HashSet::new(),
-        direct_touch_enabled: true,
+        direct_touch_enabled: config.direct_touch,
         surface_touch_ids: HashMap::new(),
     }
 }
@@ -674,10 +675,31 @@ pub(crate) async fn configure(
     sub.burst_remaining = SURFACE_BURST_FRAMES;
     request_surface_keyframe(sub, Instant::now(), true);
     forget_surface_inflight(client, surface_id);
+    let touch_releases = if !config.direct_touch {
+        apply_touch(
+            &mut session,
+            client_id,
+            surface_id,
+            TouchPhase::Cancel,
+            0,
+            Vec::new(),
+        )
+    } else {
+        Vec::new()
+    };
+    session
+        .clients
+        .get_mut(&client_id)
+        .unwrap()
+        .direct_touch_enabled = config.direct_touch;
     if let Some(compositor) = session.compositor.as_mut() {
         compositor.frame_clocks_dirty = true;
+        for command in touch_releases {
+            let _ = compositor.handle.command_tx.send(command);
+        }
     }
     session.sync_compositor_refresh_rate();
+    session.sync_touch_capability();
     drop(session);
     state.delivery_notify.notify_one();
     true
@@ -1162,11 +1184,91 @@ pub(crate) fn enqueue_remote_input(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn touch_capability_tracks_opted_in_views_and_cancels_on_disable() {
+        let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
+        let config = ViewConfig {
+            direct_touch: false,
+            width: 640,
+            height: 480,
+            max_fps: 60,
+            decoder_capacity: 4,
+            codec_support: CODEC_SUPPORT_H264,
+            color_capabilities: 0,
+        };
+        {
+            let mut session = state.session.lock().await;
+            for id in [7, 8] {
+                let (events, _) = mpsc::channel(16);
+                let mut client =
+                    hidden_client(id as u32, events, config, Arc::new(AtomicU64::new(0)));
+                client.surface_subscriptions.insert(3);
+                session.clients.insert(id, client);
+            }
+            assert!(
+                !session.wants_direct_touch(),
+                "mouse-only views must not create a touchscreen"
+            );
+            assert!(
+                apply_touch(
+                    &mut session,
+                    7,
+                    3,
+                    TouchPhase::Down,
+                    1,
+                    vec![TouchContact {
+                        id: 1,
+                        x: 10.0,
+                        y: 20.0
+                    }]
+                )
+                .is_empty()
+            );
+        }
+        let touch_config = ViewConfig {
+            direct_touch: true,
+            ..config
+        };
+        assert!(configure(&state, 7, 3, touch_config).await);
+        assert!(configure(&state, 8, 3, touch_config).await);
+        {
+            let mut session = state.session.lock().await;
+            assert!(session.wants_direct_touch());
+            assert_eq!(
+                apply_touch(
+                    &mut session,
+                    7,
+                    3,
+                    TouchPhase::Down,
+                    2,
+                    vec![TouchContact {
+                        id: 1,
+                        x: 10.0,
+                        y: 20.0
+                    }]
+                )
+                .len(),
+                1
+            );
+            assert_eq!(session.surface_touch_owner, Some(7));
+        }
+        assert!(configure(&state, 7, 3, config).await);
+        {
+            let session = state.session.lock().await;
+            assert_eq!(session.surface_touch_owner, None);
+            assert!(session.clients[&7].surface_touch_ids.is_empty());
+            assert!(session.wants_direct_touch(), "another touch viewer remains");
+        }
+        remove(&state, 8).await;
+        assert!(!state.session.lock().await.wants_direct_touch());
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn native_configure_preserves_resize_sessions_and_rejects_stale_work() {
         let state = crate::tests::process_transport::test_state(process::Server::new(false, true));
         let config = ViewConfig {
+            direct_touch: false,
             width: 64,
             height: 64,
             max_fps: 60,
@@ -1319,6 +1421,7 @@ mod tests {
                     i as u32 + 1,
                     events,
                     ViewConfig {
+                        direct_touch: false,
                         width: 64,
                         height: 64,
                         max_fps: 60,
@@ -1413,6 +1516,7 @@ mod tests {
                 1,
                 events,
                 ViewConfig {
+                    direct_touch: false,
                     width: 64,
                     height: 64,
                     max_fps: 60,
@@ -1699,6 +1803,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1747,6 +1852,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1770,6 +1876,7 @@ mod tests {
             1,
             events,
             ViewConfig {
+                direct_touch: false,
                 width: 640,
                 height: 480,
                 max_fps: 60,
@@ -1907,6 +2014,7 @@ mod tests {
                         id as u32,
                         events,
                         ViewConfig {
+                            direct_touch: true,
                             width: 640,
                             height: 480,
                             max_fps: 60,

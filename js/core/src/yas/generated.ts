@@ -502,6 +502,7 @@ export const YAS_SURFACE_STATE_MAXIMIZE_REQUEST_EXTENSION = 5 as const;
 export const YAS_SURFACE_STATE_MINIMUM_SIZE_EXTENSION = 6 as const;
 export const YAS_SURFACE_STATE_TEXT_INPUT_REQUEST_REVISION_EXTENSION = 7 as const;
 export const YAS_SURFACE_VIEW_COLOR_CAPABILITIES_EXTENSION = 8 as const;
+export const YAS_SURFACE_VIEW_DIRECT_TOUCH_EXTENSION = 9 as const;
 export const YAS_SURFACE_COLOR_CAP_DISPLAY_P3 = 1 as const;
 export const YAS_SURFACE_COLOR_CAP_HDR10_AV1 = 2 as const;
 export const YAS_SURFACE_COLOR_CAP_HDR10_AV1_444 = 4 as const;
@@ -5105,6 +5106,10 @@ export const YAS_SCHEMA = {
           "layout": "revision:u64; nonzero last committed text-input enable; retained across caret updates, changes request an input panel for existing viewers; initial snapshots do not request a panel"
         },
         {
+          "name": "view_direct_touch",
+          "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 9: enabled:u8 (0 or 1); absent means disabled; enable only for viewers with a touch device using direct-touch input; the seat advertises touch while any open view enables it; disabling cancels that view's active touch sequence"
+        },
+        {
           "name": "view_color_capabilities",
           "layout": "optional OPEN_VIEW/CONFIGURE_VIEW extension tag 8: capabilities:u8; bit 0 accepts Display-P3 SDR, bit 1 accepts 10-bit AV1 BT.2020/PQ and HDR presentation, bit 2 additionally accepts 10-bit AV1 4:4:4 Profile 1, bit 3 accepts 8-bit AV1 4:4:4, bit 4 accepts H.264 4:4:4; unknown bits are invalid; absent means sRGB SDR; output is described by each frame COLOR_SPACE using H.273 primaries/transfer/matrix and range 0 limited, 1 full; HDR output requires AV1 codec 2 and uses 10 bits, SDR output uses 8 bits"
         },
@@ -5145,6 +5150,10 @@ export const YAS_SCHEMA = {
         {
           "name": "VIEW_COLOR_CAPABILITIES_EXTENSION",
           "value": 8
+        },
+        {
+          "name": "VIEW_DIRECT_TOUCH_EXTENSION",
+          "value": 9
         },
         {
           "name": "COLOR_CAP_DISPLAY_P3",

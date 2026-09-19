@@ -359,6 +359,7 @@ interface NativeSurfaceViewState {
   width: number;
   height: number;
   maxFps: number;
+  directTouch: boolean;
   lastReceived: bigint;
   lastPresented: bigint;
   decoderQueueDepth: number;
@@ -1705,10 +1706,39 @@ export class YasNativeWorkspaceConnection {
 
   acquireSurfaceTouch(): void {
     this.surfaceTouchUsers++;
+    if (this.surfaceTouchUsers === 1) this.refreshSurfaceTouchCapability();
   }
 
   releaseSurfaceTouch(): void {
     this.surfaceTouchUsers = Math.max(0, this.surfaceTouchUsers - 1);
+    if (this.surfaceTouchUsers === 0) this.refreshSurfaceTouchCapability();
+  }
+
+  private get surfaceDirectTouch(): boolean {
+    // Advertising a virtual touchscreen on mouse-only desktops makes sites
+    // such as Apple's video player choose touch controls and ignore hover.
+    return (
+      this.surfaceTouchUsers > 0 &&
+      typeof navigator !== "undefined" &&
+      navigator.maxTouchPoints > 0
+    );
+  }
+
+  private refreshSurfaceTouchCapability(): void {
+    for (const surfaceId of this.surfaceMounts.keys()) {
+      this.requestNativeSurfaceViewRefresh(surfaceId, false, null);
+    }
+  }
+
+  private surfaceViewExtensions(directTouch: boolean) {
+    return [
+      ...surfaceColorExtensions(),
+      {
+        tag: yasGenerated.YAS_SURFACE_VIEW_DIRECT_TOUCH_EXTENSION,
+        required: false,
+        value: new Uint8Array([directTouch ? 1 : 0]),
+      },
+    ];
   }
 
   sendSurfaceTouch(
@@ -3265,6 +3295,7 @@ export class YasNativeWorkspaceConnection {
       this.surface.limits.maxViewPixels,
       this.surface.limits.maxFrameRate,
     );
+    const directTouch = this.surfaceDirectTouch;
     const existing = this.surfaceViews.get(surfaceId);
     if (existing) {
       // RESIZE writes its reliable request synchronously. CONFIGURE queues its
@@ -3279,7 +3310,8 @@ export class YasNativeWorkspaceConnection {
       const configurationChanged =
         existing.width !== parameters.width ||
         existing.height !== parameters.height ||
-        existing.maxFps !== parameters.maxFps;
+        existing.maxFps !== parameters.maxFps ||
+        !!existing.directTouch !== directTouch;
       const needsResizeFrame = resizeCallbacks.some(
         (view) => view.onFrameReady,
       );
@@ -3293,7 +3325,7 @@ export class YasNativeWorkspaceConnection {
               maxFps: parameters.maxFps,
               decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
               latencyTargetNs: 0n,
-              extensions: surfaceColorExtensions(),
+              extensions: this.surfaceViewExtensions(directTouch),
             })
             .then(() => {
               if (
@@ -3309,6 +3341,7 @@ export class YasNativeWorkspaceConnection {
               existing.width = parameters.width;
               existing.height = parameters.height;
               existing.maxFps = parameters.maxFps;
+              existing.directTouch = directTouch;
             });
         } catch (error) {
           boundaryPromise = Promise.reject(error);
@@ -3388,7 +3421,7 @@ export class YasNativeWorkspaceConnection {
       maxFps: parameters.maxFps,
       decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
       codecVersions: [...codecVersions],
-      extensions: surfaceColorExtensions(),
+      extensions: this.surfaceViewExtensions(directTouch),
     });
     if (
       pending.cancelled ||
@@ -3410,6 +3443,7 @@ export class YasNativeWorkspaceConnection {
       width: parameters.width,
       height: parameters.height,
       maxFps: parameters.maxFps,
+      directTouch,
       lastReceived: view.result.firstSequence - 1n,
       lastPresented: view.result.firstSequence - 1n,
       decoderQueueDepth: 0,

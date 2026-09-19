@@ -9,9 +9,12 @@ private renderer snapshot and produces GPU-ready vertex data.
 Each connected App owns its home connection and workspace. Component cleanup
 closes and disposes the connection, including ping timers, renderer
 subscriptions, nested Relay sessions, and their terminal and surface views.
-Workspace layouts are restored from the attached backend session, or local
-storage for embedded workspaces. Development source changes require a manual
-page reload.
+The regular app and full-control shares on `yas.run/s` use the same
+`ConnectedWorkspace` shell: workspace manager, durable tabs and layouts, and
+home-server Relay remotes. Embedders select it with `mountYasWorkspace`'s
+`home` option and a durable browser device ID. Read-only shares and fixed
+`connections` embeds use local layout storage without workspace-session
+management. Development source changes require a manual page reload.
 
 Pane content is owned by surviving leaf identity outside the recursive layout.
 Structural slots adopt the existing pane DOM when adding a first sibling,
@@ -472,6 +475,7 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - A zero-size pane or hidden browser page withdraws its surface size claim and cancels queued resizes. Showing it again reclaims its measured box, even if the dimensions are unchanged. Window resize events remeasure the box independently of changes in display DPI.
 - Native file drags announce planned screenshot filenames during hover. Selection creates private files for that drag, exposes their URI list to the destination, and fills them only after every DROP payload has validated. No prior FS upload is required. File offers expose URI and binary representations rather than making Chromium wait for unavailable image bytes during hover; this supports screenshot-thumbnail drops into Electron apps such as Legcord. Dropped files remain available until the session closes.
 - Surface views accept `touchMode="pointer" | "direct"`. Direct mode is the default and forwards each event's contact changes as Surface `TOUCH` for native Wayland multitouch. Pointer mode is the explicit fallback and maps touch to tap, finger scroll, long-press right-click, and hold-drag. The UI exposes this as **Media → Touch input**.
+- Surface `OPEN_VIEW`/`CONFIGURE_VIEW` explicitly opt into the seat's touch capability through `VIEW_DIRECT_TOUCH_EXTENSION`. Browser viewers enable it only when `navigator.maxTouchPoints > 0` and a mounted canvas uses direct mode. Mouse-only viewers and pointer-mode touch viewers do not advertise a touchscreen: a false touch capability makes sites such as Apple's video player select touch controls that fail to restore the cursor on mouse movement. Disabling a view's capability cancels its contacts; the seat retains touch while another opted-in view remains.
 - Hardware-keyboard Shift+Space is forwarded as a native key chord, preserving Shift for shortcuts such as scrolling up in a remote browser. Other printable keys use browser-resolved text to preserve the host keyboard layout.
 - Enter preserves held modifiers even when the browser omits its physical key code, so Wayland applications receive Ctrl+Enter distinctly from Enter.
 - Backspace and Delete fall back to their logical key when the browser omits or cannot identify the physical code (notably iPadOS forward Delete). Modified deletion chords and forward Delete retain hardware press/release handling. Unmodified iPad Backspace edits the capture field natively so held-key repeat continues; deletions reach the app through input events. Deletable filler remains behind the recent text, and its delayed refill preserves that text and waits beyond the initial long-press delay.

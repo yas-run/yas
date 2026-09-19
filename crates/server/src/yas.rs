@@ -8998,7 +8998,10 @@ impl Session {
         };
         if has_unknown_required(
             &request.extensions,
-            &[yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16],
+            &[
+                yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16,
+                yas_wire::schema::surface::VIEW_DIRECT_TOUCH_EXTENSION as u16,
+            ],
         ) {
             return self
                 .send_result(&frame, Status::Unsupported, Vec::new())
@@ -9080,6 +9083,7 @@ impl Session {
             .map(|native| native.state.clone())
             .ok_or(())?;
         let config = super::yas_surface_backend::ViewConfig {
+            direct_touch: yas_surface::direct_touch(&request.extensions).map_err(|_| ())?,
             color_capabilities: yas_surface::color_capabilities(&request.extensions)
                 .map_err(|_| ())?,
             width,
@@ -9236,7 +9240,10 @@ impl Session {
         };
         if has_unknown_required(
             &request.extensions,
-            &[yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16],
+            &[
+                yas_wire::schema::surface::VIEW_COLOR_CAPABILITIES_EXTENSION as u16,
+                yas_wire::schema::surface::VIEW_DIRECT_TOUCH_EXTENSION as u16,
+            ],
         ) {
             return self
                 .send_result(&frame, Status::Unsupported, Vec::new())
@@ -9284,6 +9291,7 @@ impl Session {
             None
         };
         let config = super::yas_surface_backend::ViewConfig {
+            direct_touch: yas_surface::direct_touch(&request.extensions).map_err(|_| ())?,
             color_capabilities: yas_surface::color_capabilities(&request.extensions)
                 .map_err(|_| ())?,
             width,
@@ -47104,6 +47112,7 @@ mod tests {
     async fn surface_touch_preserves_all_contact_id_bits_across_multitouch() {
         use yas_wire::schema::surface::{
             TOUCH_PHASE_CANCEL, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP,
+            VIEW_DIRECT_TOUCH_EXTENSION,
         };
         let state = super::super::tests::process_transport::test_state(
             super::super::process::Server::new(false, true),
@@ -47127,7 +47136,11 @@ mod tests {
                 max_fps: 60,
                 decoder_capacity: 3,
                 codec_versions: vec![yas_wire::schema::surface::CODEC_H264_V1 as u16],
-                extensions: Extensions::default(),
+                extensions: Extensions(vec![Extension {
+                    tag: VIEW_DIRECT_TOUCH_EXTENSION as u16,
+                    required: false,
+                    value: vec![1],
+                }]),
             },
         )
         .await;
