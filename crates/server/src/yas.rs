@@ -1285,7 +1285,7 @@ struct InboundFrame {
 struct OutboundFrame {
     frame: Frame,
     _credit: Option<CreditLease>,
-    written: Option<oneshot::Sender<()>>,
+    written: Option<oneshot::Sender<tokio::time::Instant>>,
     terminal_written: Option<Arc<TerminalFrameWriteCompletion>>,
     terminal_guard: Option<super::yas_terminal_backend::FrameWriteGuard>,
     surface_write_blocked_us: Option<Arc<AtomicU64>>,
@@ -1520,7 +1520,7 @@ impl FrameSender {
     async fn send_with_receipt(
         &self,
         frame: Frame,
-    ) -> Result<oneshot::Receiver<()>, mpsc::error::SendError<Frame>> {
+    ) -> Result<oneshot::Receiver<tokio::time::Instant>, mpsc::error::SendError<Frame>> {
         let (written, confirmed) = oneshot::channel();
         self.send_queued(frame, Some(written)).await?;
         Ok(confirmed)
@@ -1529,7 +1529,10 @@ impl FrameSender {
     async fn send_confirmed(&self, frame: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
         let failed = frame.clone();
         let confirmed = self.send_with_receipt(frame).await?;
-        confirmed.await.map_err(|_| mpsc::error::SendError(failed))
+        confirmed
+            .await
+            .map(|_| ())
+            .map_err(|_| mpsc::error::SendError(failed))
     }
 
     async fn send_surface_confirmed(
@@ -1543,7 +1546,10 @@ impl FrameSender {
         let (written, confirmed) = oneshot::channel();
         self.send_queued_with_feedback(frame, Some(written), None, None, Some(write_blocked_us))
             .await?;
-        confirmed.await.map_err(|_| mpsc::error::SendError(failed))
+        confirmed
+            .await
+            .map(|_| ())
+            .map_err(|_| mpsc::error::SendError(failed))
     }
 
     async fn send_urgent_confirmed(
@@ -1559,7 +1565,7 @@ impl FrameSender {
     async fn send_queued(
         &self,
         frame: Frame,
-        written: Option<oneshot::Sender<()>>,
+        written: Option<oneshot::Sender<tokio::time::Instant>>,
     ) -> Result<(), mpsc::error::SendError<Frame>> {
         self.send_queued_with_feedback(frame, written, None, None, None)
             .await
@@ -1580,7 +1586,7 @@ impl FrameSender {
     async fn send_queued_with_feedback(
         &self,
         frame: Frame,
-        written: Option<oneshot::Sender<()>>,
+        written: Option<oneshot::Sender<tokio::time::Instant>>,
         terminal_written: Option<Arc<TerminalFrameWriteCompletion>>,
         terminal_guard: Option<super::yas_terminal_backend::FrameWriteGuard>,
         surface_write_blocked_us: Option<Arc<AtomicU64>>,
@@ -2171,7 +2177,7 @@ async fn serve_registered<S>(
             }
             writer_bytes.fetch_add(encoded.len() as u64, Ordering::Relaxed);
             if let Some(written) = queued.written.take() {
-                let _ = written.send(());
+                let _ = written.send(tokio::time::Instant::now());
             }
             if let Some(written) = queued.terminal_written.take() {
                 written.complete(TerminalFrameWriteOutcome::Written);
@@ -2366,6 +2372,7 @@ async fn serve_registered<S>(
     catalogue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     catalogue_tick.tick().await;
     let heartbeat_out = session.out.clone();
+    session.transport_rtt_us = Arc::clone(&heartbeat.rtt_us);
     // Race the entire dispatch future, including awaited family handlers, so
     // backpressure cannot prevent the liveness deadline from being enforced.
     let dispatch = async {
@@ -2669,6 +2676,7 @@ struct Session {
     internal: mpsc::Sender<Internal>,
     terminal_frames: mpsc::Sender<super::yas_terminal_backend::Frame>,
     surface_events: mpsc::Sender<super::yas_surface_backend::Event>,
+    transport_rtt_us: Arc<AtomicU64>,
     surface_send: Option<tokio::task::JoinHandle<Result<(), ()>>>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     media_audio: mpsc::Sender<NativeAudioFrame>,
@@ -4684,7 +4692,7 @@ enum MediaStream {
         acknowledged_sequence: u64,
         credit_frames: u16,
         status_revision: u64,
-        last_reliable_frame_written: Option<oneshot::Receiver<()>>,
+        last_reliable_frame_written: Option<oneshot::Receiver<tokio::time::Instant>>,
         _credit: CreditLease,
     },
     Input {
@@ -7025,6 +7033,7 @@ impl Session {
             internal,
             terminal_frames,
             surface_events,
+            transport_rtt_us: Arc::default(),
             surface_send: None,
             media_audio,
             _registration: registration,
@@ -7449,7 +7458,7 @@ impl Session {
         &self,
         frame: Frame,
         context: DatagramContext,
-    ) -> Result<Option<oneshot::Receiver<()>>, ()> {
+    ) -> Result<Option<oneshot::Receiver<tokio::time::Instant>>, ()> {
         match self.try_send_transport_datagram(&frame, context) {
             DatagramAttempt::Sent | DatagramAttempt::Dropped => Ok(None),
             DatagramAttempt::ReliableFallback => {
@@ -9100,6 +9109,7 @@ impl Session {
             config,
             self.surface_events.clone(),
             Arc::clone(&write_blocked_us),
+            Arc::clone(&self.transport_rtt_us),
         )
         .await
         else {
@@ -12983,7 +12993,7 @@ impl Session {
         // remain intentionally lossy and carry no reliable write receipt.
         if let Some(written) = output_frame_written {
             tokio::select! {
-                result = written => result.map_err(|_| ())?,
+                result = written => { result.map_err(|_| ())?; },
                 _ = self.cancellation.cancelled() => return Err(()),
             }
         }
@@ -28271,7 +28281,7 @@ impl Session {
         status: Status,
         body: Vec<u8>,
         sensitive: bool,
-    ) -> Result<oneshot::Receiver<()>, ()> {
+    ) -> Result<oneshot::Receiver<tokio::time::Instant>, ()> {
         let payload = ResultPrefix {
             status,
             detail: Extensions::default(),
@@ -35912,7 +35922,7 @@ async fn send_surface_eos(
     view_id: u32,
     sequence: u64,
     codec_version: u16,
-) -> Result<oneshot::Receiver<()>, ()> {
+) -> Result<oneshot::Receiver<tokio::time::Instant>, ()> {
     let now = monotonic_ns();
     let payload = yas_surface::SurfaceFrame {
         view_id,
@@ -43098,7 +43108,12 @@ mod tests {
                 let write = async {
                     let mut queued = receivers.recv(&cancellation).await.unwrap();
                     queued.record_write_duration(Duration::from_millis(elapsed_ms));
-                    queued.written.take().unwrap().send(()).unwrap();
+                    queued
+                        .written
+                        .take()
+                        .unwrap()
+                        .send(tokio::time::Instant::now())
+                        .unwrap();
                 };
                 tokio::join!(send, write);
             })
@@ -43679,7 +43694,7 @@ mod tests {
             .written
             .take()
             .expect("first Media write receipt")
-            .send(());
+            .send(tokio::time::Instant::now());
         assert!(!close.is_finished());
 
         let mut second = outbound.receivers.recv(&cancellation).await.unwrap();
@@ -43689,7 +43704,7 @@ mod tests {
             .written
             .take()
             .expect("latest Media write receipt")
-            .send(())
+            .send(tokio::time::Instant::now())
             .unwrap();
         timeout(TEST_TIMEOUT, close)
             .await
@@ -43917,7 +43932,7 @@ mod tests {
             .written
             .take()
             .expect("urgent write confirmation")
-            .send(())
+            .send(tokio::time::Instant::now())
             .unwrap();
         drop(queued);
         timeout(TEST_TIMEOUT, confirmation)

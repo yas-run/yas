@@ -121,6 +121,7 @@ pub(crate) enum Event {
 pub(crate) struct Sink {
     view_id: u32,
     events: mpsc::Sender<Event>,
+    pub(super) transport_rtt_us: Arc<AtomicU64>,
 }
 
 impl Sink {
@@ -512,7 +513,11 @@ fn hidden_client(
         origin: ConnectionOrigin::Network,
         catalog_visible: false,
         native_identity: None,
-        native_surface: Some(Sink { view_id, events }),
+        native_surface: Some(Sink {
+            view_id,
+            events,
+            transport_rtt_us: Arc::default(),
+        }),
         lead: None,
         subscriptions: FxHashSet::default(),
         surface_subscriptions: FxHashSet::default(),
@@ -587,6 +592,7 @@ pub(crate) async fn register(
     config: ViewConfig,
     events: mpsc::Sender<Event>,
     write_blocked_us: Arc<AtomicU64>,
+    transport_rtt_us: Arc<AtomicU64>,
 ) -> Option<Registration> {
     let mut session = state.session.lock().await;
     if session
@@ -599,6 +605,7 @@ pub(crate) async fn register(
     let client_id = session.next_client_id.max(1);
     session.next_client_id = client_id.checked_add(1)?;
     let mut client = hidden_client(view_id, events, config, write_blocked_us);
+    client.native_surface.as_mut()?.transport_rtt_us = transport_rtt_us;
     client.surface_subscriptions.insert(surface_id);
     client
         .surface_view_sizes
@@ -1261,6 +1268,178 @@ mod tests {
         }
         remove(&state, 8).await;
         assert!(!state.session.lock().await.wants_direct_touch());
+    }
+
+    #[derive(Clone, Copy)]
+    enum Pressure {
+        None,
+        Writer,
+        Decoder,
+    }
+
+    struct PathOutcome {
+        client: ClientState,
+        delivered: usize,
+        peak_bytes: usize,
+        settled_peak_bytes: usize,
+        peak_quantizer: u8,
+    }
+
+    fn simulate_surface_path(
+        delay_ms: u64,
+        batch_ms: u64,
+        slots: u8,
+        bytes_per_second: usize,
+        pressure: Pressure,
+    ) -> PathOutcome {
+        let start = Instant::now();
+        let (events, _received) = mpsc::channel(64);
+        let mut client = hidden_client(
+            1,
+            events,
+            ViewConfig {
+                direct_touch: false,
+                width: 1920,
+                height: 1080,
+                max_fps: 60,
+                decoder_capacity: slots,
+                codec_support: CODEC_SUPPORT_AV1,
+                color_capabilities: 0,
+            },
+            Arc::default(),
+        );
+        let transport_rtt_us =
+            Arc::clone(&client.native_surface.as_ref().unwrap().transport_rtt_us);
+        client.goodput_window_start = start;
+        client.surface_goodput_window_start = start;
+        let sub = client.surface_subs.entry(1).or_default();
+        sub.max_inflight_frames = Some(usize::from(slots));
+        sub.source_frame_interval_ms = 1_000.0 / 60.0;
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let mut due = VecDeque::new();
+        let mut wire_free_at = 0;
+        let mut last_generation = 0;
+        let mut delivered = 0;
+        let mut peak_bytes = 0;
+        let mut settled_peak_bytes = 0;
+        let mut peak_quantizer = ceiling;
+        for elapsed_ms in 0..60_000_u64 {
+            let now = start + Duration::from_millis(elapsed_ms);
+            // Two default-cadence Core Pings have completed. The independent
+            // wire test covers measurement and sharing with existing views.
+            if elapsed_ms == 22_000 {
+                transport_rtt_us.store(delay_ms * 1_000, Ordering::Relaxed);
+            }
+            while due.front().is_some_and(|at| *at <= elapsed_ms) {
+                due.pop_front();
+                record_surface_ack_at(&mut client, 1, now);
+                if elapsed_ms >= 55_000 {
+                    delivered += 1;
+                }
+            }
+            let generation = elapsed_ms * 60 / 1_000 + 1;
+            if generation == last_generation {
+                continue;
+            }
+            match pressure {
+                Pressure::None => {}
+                Pressure::Writer => {
+                    client
+                        .write_blocked_us
+                        .fetch_add(WRITE_BLOCKED_CONGESTED_US + 1, Ordering::Relaxed);
+                }
+                Pressure::Decoder => {
+                    update_surface_decoder_queue(client.surface_subs.get_mut(&1).unwrap(), 12, now);
+                }
+            }
+            step_adaptive_bandwidth(&mut client, SurfaceBandwidth::Medium, 1, now, false);
+            let q = client.surface_subs[&1]
+                .adaptive_quantizer
+                .unwrap_or(ceiling);
+            peak_quantizer = peak_quantizer.max(q);
+            // Synthetic monotonic rate response, not an encoder/visual benchmark.
+            let bytes = (20_000.0_f32 * 2.0_f32.powf((ceiling as f32 - q as f32) / 24.0)) as usize;
+            if surface_frame_credit_open_or_mark(&mut client, 1, bytes) {
+                record_surface_frame_sent(&mut client, 1, bytes, false, now);
+                let serialization_ms = if bytes_per_second == 0 {
+                    0
+                } else {
+                    (bytes as u64 * 1_000).div_ceil(bytes_per_second as u64)
+                };
+                wire_free_at = wire_free_at.max(elapsed_ms) + serialization_ms;
+                due.push_back((wire_free_at + delay_ms).div_ceil(batch_ms) * batch_ms);
+                last_generation = generation;
+            }
+            peak_bytes = peak_bytes.max(client.surface_inflight_bytes);
+            if elapsed_ms >= 55_000 {
+                settled_peak_bytes = settled_peak_bytes.max(client.surface_inflight_bytes);
+            }
+            assert!(client.surface_inflight_frames.len() <= usize::from(slots));
+        }
+        PathOutcome {
+            client,
+            delivered,
+            peak_bytes,
+            settled_peak_bytes,
+            peak_quantizer,
+        }
+    }
+
+    #[test]
+    fn healthy_delayed_surface_credit_recovers_quality_without_buying_frame_slots() {
+        for delay in [200, 300, 500] {
+            for batch in [1, 50] {
+                for slots in [16, 64] {
+                    let outcome = simulate_surface_path(delay, batch, slots, 0, Pressure::None);
+                    let client = &outcome.client;
+                    let sub = &client.surface_subs[&1];
+                    assert_eq!(
+                        sub.adaptive_quantizer, None,
+                        "delay={delay}, batch={batch}, slots={slots}, peak_q={}",
+                        outcome.peak_quantizer
+                    );
+                    assert_eq!(sub.adaptive_scale_shift, 0);
+                    assert!(sub.congested_at.is_none());
+                    assert!(surface_ack_window_ms(client) >= delay as f32);
+                    // A negotiated count window can cap cadence below 60 Hz.
+                    let possible_fps =
+                        (f64::from(slots) * 1_000.0 / (delay + batch) as f64).min(60.0);
+                    assert!(
+                        outcome.delivered as f64 >= possible_fps * 5.0 * 0.9,
+                        "delay={delay}, batch={batch}, slots={slots}: delivered={}",
+                        outcome.delivered
+                    );
+                    assert!(outcome.peak_bytes <= usize::from(slots) * 20_000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn limited_throughput_surface_credit_still_reduces_quality() {
+        let outcome = simulate_surface_path(50, 50, 16, 100_000, Pressure::None);
+        let sub = &outcome.client.surface_subs[&1];
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        assert!(sub.adaptive_quantizer.unwrap_or(ceiling) > ceiling + ADAPTIVE_STEP);
+        assert!(outcome.peak_bytes <= 16 * 20_000);
+        assert!(
+            outcome.settled_peak_bytes < 60_000,
+            "settled queue retained {} bytes",
+            outcome.settled_peak_bytes
+        );
+        assert!(outcome.delivered < 275);
+        assert!(sub.congested_at.is_none());
+    }
+
+    #[test]
+    fn delayed_surface_writer_and_decoder_pressure_still_reduce_quality() {
+        for pressure in [Pressure::Writer, Pressure::Decoder] {
+            let outcome = simulate_surface_path(300, 50, 16, 0, pressure);
+            let sub = &outcome.client.surface_subs[&1];
+            let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+            assert!(sub.adaptive_quantizer.unwrap_or(ceiling) > ceiling + ADAPTIVE_STEP);
+            assert!(sub.congested_at.is_some());
+        }
     }
 
     #[cfg(target_os = "linux")]
