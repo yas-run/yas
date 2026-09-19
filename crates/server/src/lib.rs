@@ -3693,10 +3693,16 @@ fn surface_frame_window(client: &ClientState) -> usize {
 }
 
 fn surface_ack_window_ms(client: &ClientState) -> f32 {
-    client
-        .surface_ack_timing
-        .baseline_ms
-        .unwrap_or_else(|| path_rtt_ms(client))
+    // Core Ping measures the live connection even while video never drains.
+    // An older empty-pipe Surface sample must not cap a confirmed path change.
+    let transport_ms = client.native_surface.as_ref().map_or(0.0, |sink| {
+        sink.transport_rtt_us.load(Ordering::Relaxed) as f32 / 1_000.0
+    });
+    match client.surface_ack_timing.baseline_ms {
+        Some(ack_ms) => ack_ms.max(transport_ms),
+        None if transport_ms > 0.0 => transport_ms,
+        None => path_rtt_ms(client),
+    }
 }
 
 fn estimated_surface_frame_bytes(client: &ClientState, surface_id: u16, keyframe: bool) -> usize {
@@ -3775,17 +3781,11 @@ fn surface_credit_open_for(client: &ClientState, next_frame_bytes: usize) -> boo
             <= surface_credit_limit_bytes(client, next_frame_bytes)
 }
 
-/// Admit a frame only when both the shared byte window and this surface's
-/// negotiated decoder window have room. The latter must be enforced before
-/// encoding: producing a delta which the protocol view then rejects advances
-/// the encoder reference chain without advancing the decoder's, forcing the
-/// next admitted frame to be another expensive keyframe.
-fn surface_frame_credit_open_for(
-    client: &ClientState,
-    surface_id: u16,
-    next_frame_bytes: usize,
-) -> bool {
-    let slot_open = client
+/// Enforce count-based admission before encoding: producing a delta which
+/// the protocol view then rejects advances the encoder reference chain without
+/// advancing the decoder's, forcing another expensive keyframe.
+fn surface_frame_slot_open_for(client: &ClientState, surface_id: u16) -> bool {
+    client
         .surface_subs
         .get(&surface_id)
         .and_then(|sub| sub.max_inflight_frames)
@@ -3796,22 +3796,35 @@ fn surface_frame_credit_open_for(
                 .filter(|frame| frame.surface_id == surface_id)
                 .count()
                 < maximum
-        });
-    slot_open
+        })
         && client
             .native_surface
             .as_ref()
             .is_none_or(|sink| sink.has_capacity())
+}
+
+#[cfg(test)]
+fn surface_frame_credit_open_for(
+    client: &ClientState,
+    surface_id: u16,
+    next_frame_bytes: usize,
+) -> bool {
+    surface_frame_slot_open_for(client, surface_id)
         && surface_credit_open_for(client, next_frame_bytes)
 }
 
-/// Check per-surface delivery credit and remember real demand that it denied.
+/// Check per-surface delivery credit and remember byte demand it denied.
 fn surface_frame_credit_open_or_mark(
     client: &mut ClientState,
     surface_id: u16,
     next_frame_bytes: usize,
 ) -> bool {
-    let open = surface_frame_credit_open_for(client, surface_id, next_frame_bytes);
+    // Smaller frames cannot free a frame slot. Only byte-window exhaustion
+    // with room for another frame is evidence for the quality budget arm.
+    if !surface_frame_slot_open_for(client, surface_id) {
+        return false;
+    }
+    let open = surface_credit_open_for(client, next_frame_bytes);
     if !open {
         client
             .surface_subs
@@ -18000,6 +18013,28 @@ mod tests {
 
         record_surface_ack(&mut client, 1);
         assert!(surface_credit_open_for(&client, 1_000));
+    }
+
+    #[test]
+    fn surface_frame_slot_exhaustion_does_not_report_byte_pressure() {
+        let mut client = test_client();
+        client.surface_goodput_sampled = true;
+        client.surface_goodput_bps = 1_000.0;
+        client
+            .surface_subs
+            .entry(1)
+            .or_default()
+            .max_inflight_frames = Some(2);
+        let now = Instant::now();
+        for _ in 0..2 {
+            record_surface_frame_sent(&mut client, 1, 20_000, false, now);
+        }
+        assert!(!surface_credit_open_for(&client, 20_000));
+        assert!(!surface_frame_credit_open_or_mark(&mut client, 1, 20_000));
+        assert!(!client.surface_subs[&1].credit_limited_since_step);
+        record_surface_ack_at(&mut client, 1, now + Duration::from_millis(200));
+        assert!(!surface_frame_credit_open_or_mark(&mut client, 1, 20_000));
+        assert!(client.surface_subs[&1].credit_limited_since_step);
     }
 
     #[test]
