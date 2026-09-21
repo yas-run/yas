@@ -2776,17 +2776,19 @@ export class YasTerminalSurface {
 
       // A Wayland copy need not reach the host clipboard (Brave can deny the
       // export). Cmd+V must read it here: an empty host clipboard may produce
-      // no native paste event at all. Browser-owned Cmd+V still uses that event
-      // below, without requiring navigator.clipboard.readText permission.
+      // no native paste event at all. Browser-owned Cmd+V uses that event
+      // without requiring navigator.clipboard.readText permission. Reserve the
+      // chord in enhanced keyboard modes too, rather than encoding Super+V.
       if (
         e.metaKey &&
         !e.ctrlKey &&
         !e.altKey &&
-        (e.key === "v" || e.key === "V") &&
-        this._yasConn?.usesWaylandClipboard?.()
+        (e.key === "v" || e.key === "V")
       ) {
-        e.preventDefault();
-        if (!e.repeat) void this.pasteFromClipboard();
+        if (this._yasConn?.usesWaylandClipboard?.()) {
+          e.preventDefault();
+          if (!e.repeat) void this.pasteFromClipboard();
+        }
         return;
       }
 
