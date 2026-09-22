@@ -33,12 +33,27 @@ are not empty server snapshots. Relay routes and product connections also stay
 in place during retries, so a home-link interruption does not rebuild every
 remote workspace.
 
-On iOS/iPadOS, Safari and installed apps share a fixed opaque top strip to
+In iOS/iPadOS Safari tabs, a fixed opaque top strip helps
 suppress the system scroll-edge blur. It follows the palette, sits above
 workspace overlays, and is at least 11 CSS pixels tall: WebKit samples a 2px
 band 4px from the edge and ignores background colours on boxes at most 10px
 tall. Both the root and the keyboard-pinned workspace reserve the strip's
 safe-area inset so it never covers the tabs.
+
+Installed iOS apps request an opaque black native status bar and switch to
+`viewport-fit=contain` before the workspace mounts. WebKit owns the unsafe
+screen edges, and `100dvh` sizes the normal-flow shell to the usable viewport.
+The opaque sticky tab bar stays in flow without an extra anti-blur spacer.
+Contained mode disables YAS's manual safe-area padding as well: iOS already
+reserves it, even when `env(safe-area-inset-*)` continues to return nonzero sizes.
+Detection accepts both the display-mode media query and `navigator.standalone`,
+since iOS may expose only the latter.
+
+On the tested iPhone running iOS 27, edge-to-edge mode blurred the top controls
+with static, sticky, and unified opaque fixed headers. Enlarging the contained
+shell to the large viewport clipped the footer; `height=device-height` had no
+effect. Containment is the verified blur-free fallback, not a fix for WebKit's
+native scroll-edge effect or a way to reclaim its reserved top area.
 
 ## Render pipeline overview
 
@@ -192,6 +207,17 @@ Cmd+V works even when an empty host clipboard produces no browser paste event.
 For browser-owned clipboard contents, Cmd+V keeps using the native paste event,
 including in enhanced keyboard modes: the paste chord is never sent as Super+V.
 
+The mobile toolbar's terminal Paste action starts one structured clipboard read
+directly in the tap gesture, preserving iOS authorization for screenshots. It
+activates on native touch release while retaining textarea focus, rather than
+waiting for a compatibility click that can arrive after the toolbar disappears.
+This explicit device-clipboard action bypasses remembered Wayland ownership
+(taking an iOS screenshot need not emit a browser copy event) and prefers an
+image over accompanying text. It publishes the image to the server clipboard
+and waits for that transfer to commit before sending the terminal application's
+paste chord. A failed image paste never substitutes text. With no image, it
+pastes plain text; text-only browsers fall back to `readText`.
+
 The native viewer requests disambiguation and key events from supporting host
 terminals, enabling all-key reporting only when the focused child requests it.
 Crossterm does not expose layout alternatives or associated-text fields, so
@@ -256,6 +282,10 @@ with fixed `top`/`height` positioning. It stays untransformed so terminal and
 surface IME targets retain viewport coordinates and remain aligned with their
 rendered cursors; adding the viewport offset twice puts the hidden input
 behind the keyboard and triggers another browser reveal pan.
+Keyboard detection compares the visible band with the shell's measured CSS
+height (`100dvh`), not `innerHeight`, which can include Safari's browser bars.
+Expanding or collapsing those bars alone must leave the workspace in its normal
+layout, with tabs below the system strip and the footer at the bottom.
 
 Branches and Commit Log expand automatically for Git roots and fold outside
 repositories. Manual Git-section toggles last only for the current root and

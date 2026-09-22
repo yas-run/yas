@@ -496,6 +496,44 @@ describe("YasNativeWorkspaceConnection", () => {
     ]);
   });
 
+  it("commits a screenshot upload with the operation ID that began it", async () => {
+    vi.doMock("@yas-run/browser", () => ({
+      blake3_hash: () => new Uint8Array(32),
+    }));
+    const write = vi.fn().mockResolvedValue(undefined);
+    const closeWrite = vi.fn();
+    const beginSet = vi.fn().mockResolvedValue({
+      stagingHandle: 42n,
+      transfers: [{ write, closeWrite, closed: Promise.resolve() }],
+    });
+    const commitSet = vi.fn().mockResolvedValue(1n);
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection, {
+      selectionClient: { beginSet, commitSet },
+      selectionWrites: new Map(),
+      waylandClipboardExpected: false,
+    });
+    const screenshot = new Uint8Array(300_000).fill(123);
+    try {
+      await connection.sendClipboard("image/png", screenshot);
+      expect(beginSet).toHaveBeenCalledOnce();
+      expect(write).toHaveBeenCalledWith(screenshot);
+      expect(closeWrite).toHaveBeenCalledOnce();
+      // The server rejects SET_COMMIT with CONFLICT if this identity changes.
+      expect(commitSet).toHaveBeenCalledExactlyOnceWith(
+        42n,
+        beginSet.mock.calls[0][1],
+      );
+      expect(closeWrite.mock.invocationCallOrder[0]).toBeLessThan(
+        commitSet.mock.invocationCallOrder[0],
+      );
+    } finally {
+      vi.doUnmock("@yas-run/browser");
+    }
+  });
+
   it("reserves a host clipboard write until the Wayland selection arrives", async () => {
     const originalClipboard = Object.getOwnPropertyDescriptor(
       navigator,

@@ -4054,7 +4054,10 @@ export class YasNativeWorkspaceConnection {
     }
     const { blake3_hash } = await import("@yas-run/browser");
     const hash = blake3_hash(data);
-    const batch = await this.selection.beginSet(slot, operationId(), [
+    // SET_COMMIT belongs to the operation that allocated the staged upload.
+    // A fresh ID here is a different operation and the server rejects it.
+    const id = operationId();
+    const batch = await this.selection.beginSet(slot, id, [
       {
         mime,
         byteLength: BigInt(data.length),
@@ -4067,7 +4070,7 @@ export class YasNativeWorkspaceConnection {
     await transfer.write(data);
     transfer.closeWrite();
     await transfer.closed;
-    await this.selection.commitSet(batch.stagingHandle, operationId());
+    await this.selection.commitSet(batch.stagingHandle, id);
   }
 
   private queueSelectionWrite(

@@ -137,6 +137,7 @@ import {
 } from "./theme";
 import { t, tp } from "./i18n";
 import { applySystemChrome } from "./systemChrome";
+import { observeWorkspaceViewport } from "./workspaceViewport";
 import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
 import { DesktopChrome } from "./DesktopChrome";
@@ -1243,47 +1244,15 @@ function WorkspaceScreen(props: {
   const [vpOffset, setVpOffset] = createSignal(0);
   const [vpBaseHeight, setVpBaseHeight] = createSignal(0);
   onMount(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    let baseWidth = 0;
-    const update = () => {
-      const height = vv.height;
-      const width = vv.width;
-      const fullHeight = Math.max(height, window.innerHeight);
-      batch(() => {
-        setVpHeight(height);
-        setVpOffset(vv.offsetTop);
-        setVpBaseHeight((prev) => {
-          // A large width change means rotation or device-mode resize; reset the
-          // baseline instead of carrying a portrait height into landscape.
-          if (baseWidth === 0 || Math.abs(width - baseWidth) > 48) {
-            baseWidth = width;
-            return fullHeight;
-          }
-
-          // Grow with browser chrome collapse.  Also allow small decreases so
-          // address-bar changes do not look like a keyboard; never learn a
-          // keyboard-shrunken viewport (>150px) as the new baseline.
-          if (fullHeight > prev || prev - height <= 150) {
-            baseWidth = width;
-            return fullHeight;
-          }
-          return prev;
+    onCleanup(
+      observeWorkspaceViewport(({ height, offsetTop, baselineHeight }) => {
+        batch(() => {
+          setVpHeight(height);
+          setVpOffset(offsetTop);
+          setVpBaseHeight(baselineHeight);
         });
-      });
-    };
-    update(); // initialise immediately
-    vv.addEventListener("resize", update);
-    vv.addEventListener("scroll", update);
-    window.addEventListener("resize", update);
-    const onOrientationChange = () => setTimeout(update, 150);
-    screen.orientation?.addEventListener("change", onOrientationChange);
-    onCleanup(() => {
-      vv.removeEventListener("resize", update);
-      vv.removeEventListener("scroll", update);
-      window.removeEventListener("resize", update);
-      screen.orientation?.removeEventListener("change", onOrientationChange);
-    });
+      }),
+    );
   });
 
   // How much of the layout viewport something is parked over: a software
@@ -5265,7 +5234,7 @@ function WorkspaceScreen(props: {
                 // Fixed positioning bypasses #root's safe-area padding.
                 // Keep the tabs below the opaque system-bar strip here too.
                 padding:
-                  "var(--yas-system-bar-inset-top, 0px) env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px)",
+                  "var(--yas-system-bar-inset-top, 0px) var(--yas-safe-area-right, env(safe-area-inset-right, 0px)) 0 var(--yas-safe-area-left, env(safe-area-inset-left, 0px))",
               }
             : {}),
         }}
@@ -6512,7 +6481,7 @@ function WorkspaceScreen(props: {
           <div
             aria-hidden="true"
             style={{
-              height: "env(safe-area-inset-bottom)",
+              height: "var(--yas-safe-area-bottom, env(safe-area-inset-bottom))",
               "flex-shrink": 0,
               "background-color": theme().bg,
             }}
