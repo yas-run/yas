@@ -2702,11 +2702,6 @@ struct SurfaceSubState {
     /// `None` — the default — means the client participates in mediation via
     /// Surface Resize like any other viewer.
     scaled_target: Option<(u16, u16)>,
-    /// `scaled_target` is normally literal (for previews), but native Surface
-    /// views also use it to name their independent physical viewport. Those
-    /// views opt into transport downscaling while preserving that requested
-    /// box as the upper bound.
-    allow_adaptive_scale: bool,
     /// Explicit cadence ceiling from Surface Subscribe. `None` uses the
     /// client's display rate; thumbnails set a lower value without changing
     /// the cadence of a full-size view of another surface.
@@ -2716,17 +2711,6 @@ struct SurfaceSubState {
     /// surfaces can split its bandwidth budget between them.  0 = no
     /// frame measured yet.
     frame_bytes: f32,
-    /// EWMA wall time spent encoding one frame for this subscriber. Unlike
-    /// the session-wide timing counters used for diagnostics, this survives
-    /// log intervals and lets an app-limited local link distinguish "the
-    /// encoder cannot produce frames" from "the transport cannot carry
-    /// frames". Excludes the first encode after creation, which can include
-    /// driver warmup. 0 = no warm encode measured yet (Vulkan Video never
-    /// enters the server-side encode path and therefore stays at 0).
-    encode_work_us: f32,
-    /// This encoder has completed its first, potentially cold encode. Reset
-    /// on recreation so driver warmup cannot shrink a fast stream.
-    encode_warmed_up: bool,
     /// Quantizer the adaptive controller is currently asking for.  `None`
     /// = run at the ceiling (`bandwidth_override` / server default).
     adaptive_quantizer: Option<u8>,
@@ -2744,18 +2728,6 @@ struct SurfaceSubState {
     /// otherwise a saturated link alternates between one expensive stall
     /// and an immediate walk back to maximum quality.
     congested_at: Option<Instant>,
-    /// Power-of-two server-side downscale applied after the ordinary
-    /// per-viewer target is chosen. This is transport adaptation only: it
-    /// never changes the compositor's logical size or the coordinate space
-    /// used for pointer input.
-    adaptive_scale_shift: u8,
-    /// Last time adaptive delivery changed the encoded extent.
-    scale_stepped_at: Option<Instant>,
-    /// Most recent direct transport, decoder, or encoder pressure. Resolution
-    /// recovery probes are measured from this; an ACK window merely being
-    /// full is flow control, not evidence that the path or decoder is
-    /// overloaded.
-    adaptive_pressure_at: Option<Instant>,
     /// Bit per Vulkan Video encoder whose 4:2:0 profile the compositor has
     /// refused for this client and surface (see
     /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched at one
@@ -4028,12 +4000,7 @@ fn accept_completed_encode(
 /// a later surface resize happens to break that deadlock by recompositing.
 fn accept_completed_creation(state: &mut SurfaceSubState) -> EncoderCompletion {
     state.creation_in_flight = false;
-    let disposition = completed_encoder_disposition(state);
-    if disposition != EncoderCompletion::Accept {
-        return disposition;
-    }
-    state.encode_warmed_up = false;
-    EncoderCompletion::Accept
+    completed_encoder_disposition(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -4080,34 +4047,6 @@ const ADAPTIVE_STEP: u8 = 6;
 /// A backend that cannot retarget in place has to be rebuilt, which costs a
 /// keyframe — only worth it past this much accumulated drift.
 const ADAPTIVE_REBUILD_STEP: u8 = 24;
-/// Maximum linear downscale for an encoder that cannot process the requested
-/// pixel count at an interactive cadence. Delivery pressure never uses this
-/// arm; it adapts quantization and frame cadence instead.
-const ADAPTIVE_MAX_SCALE_SHIFT: u8 = 3;
-/// An overloaded encoder can return to its sustainable target quickly, but
-/// not quickly enough to rebuild repeatedly on transient work spikes.
-const ADAPTIVE_SCALE_BACKOFF_INTERVAL: Duration = Duration::from_millis(750);
-/// Probe one resolution step upward when measured encode work has enough
-/// headroom for the larger pixel count.
-const ADAPTIVE_SCALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
-/// Each linear downscale quarters pixel work. Do not rebuild the encoder for
-/// a marginal excursion; require the current work to exceed this ratio.
-const ADAPTIVE_SCALE_PRESSURE_RATIO: f32 = 1.5;
-/// Software encoding is allowed to choose detail over refresh rate, but once
-/// it cannot sustain an interactive 30 fps, more pixels make input visibly
-/// laggy even on a perfect local link. Faster requested cadences still use
-/// newest-wins delivery; this is only the floor the resolution controller
-/// tries to make the encoder clear.
-const ADAPTIVE_ENCODER_TARGET_FPS: f32 = 30.0;
-/// Ignore small encode-time excursions around the target. A sustained sample
-/// at least 25% over budget is pressure; resolution changes themselves are
-/// already rate-limited separately.
-const ADAPTIVE_ENCODER_PRESSURE_RATIO: f32 = 1.25;
-/// Growing either axis doubles it, so the next resolution step is expected to
-/// cost about 4x as much work. Require additional headroom before doing that;
-/// otherwise a software encoder alternates forever between one sustainable
-/// extent and the next unsustainable one.
-const ADAPTIVE_ENCODER_RECOVERY_RATIO: f32 = 0.75;
 /// Write time beyond the serialization allowance within one step interval
 /// that counts as congestion. Normal short writes do not contribute.
 const WRITE_BLOCKED_CONGESTED_US: u64 = 25_000;
@@ -4236,10 +4175,7 @@ fn resolve_bandwidth(
     }
 }
 
-/// Run one step of the controller for a surface and report whether the live
-/// encoder now needs rebuilding (the backend could not retarget in place and
-/// the drift is large enough to be worth a keyframe).
-/// Outcome of one adaptive step for a surface.
+/// Outcome of one adaptive bandwidth step for a surface.
 struct AdaptiveStep {
     /// The quantizer moved, and the encoder in hand could not take the new
     /// rate in place, so it has to be rebuilt (paying a keyframe).
@@ -4248,67 +4184,9 @@ struct AdaptiveStep {
     /// A compositor-resident encoder is retargeted with this; a local one
     /// has already been retargeted in place.
     quantizer: Option<u8>,
-    /// Delivery pressure changed this client's encoded extent. The caller
-    /// must retire the old encoder and wait for the next tick, which derives
-    /// and registers the new target.
-    target_changed: bool,
 }
 
-/// Number of additional 2x linear downscale steps needed for an observed cost
-/// to fit its budget. Each step quarters pixel count and therefore
-/// approximates a 4x reduction in both frame bytes and encode work.
-fn adaptive_scale_steps(observed: f32, budget: f32) -> u8 {
-    if observed <= 0.0 || budget <= 0.0 {
-        return 1;
-    }
-    let mut ratio = observed / budget;
-    let mut steps = 0;
-    while ratio > ADAPTIVE_SCALE_PRESSURE_RATIO && steps < ADAPTIVE_MAX_SCALE_SHIFT {
-        ratio /= 4.0;
-        steps += 1;
-    }
-    steps.max(1)
-}
-
-/// Encode-time allowance for an interactive surface. A thumbnail explicitly
-/// capped below 30 fps gets its full cadence interval; a high-refresh display
-/// does not force a CPU fallback to trade the entire picture for 144 fps.
-fn surface_encode_budget_us(client: &ClientState, surface_id: u16) -> f32 {
-    let fps = surface_pacing_fps(client, surface_id).clamp(1.0, ADAPTIVE_ENCODER_TARGET_FPS);
-    1_000_000.0 / fps
-}
-
-fn encoder_scale_recovery_has_headroom(encode_work_us: f32, budget_us: f32) -> bool {
-    encode_work_us <= 0.0 || encode_work_us * 4.0 <= budget_us * ADAPTIVE_ENCODER_RECOVERY_RATIO
-}
-
-fn record_surface_encode_work(state: &mut SurfaceSubState, work_us: u64) {
-    // First-use driver work can take hundreds of milliseconds while normal
-    // frames cost only a few. Exclude exactly one completion per encoder;
-    // a slow CPU fallback is still detected after its second frame. Keep
-    // every later sample, including alternating expensive and cheap frames.
-    if !std::mem::replace(&mut state.encode_warmed_up, true) {
-        return;
-    }
-    let sample = work_us as f32;
-    state.encode_work_us = if state.encode_work_us <= 0.0 {
-        sample
-    } else {
-        ewma_with_direction(state.encode_work_us, sample, 0.5, 0.25)
-    };
-}
-
-/// Apply transport adaptation to an already aspect-preserving encode target.
-/// Both axes use the same divisor; even rounding is required by every video
-/// backend and differs from the exact aspect by at most one source pixel.
-fn adaptive_surface_target(width: u32, height: u32, shift: u8) -> (u32, u32) {
-    let divisor = 1u32 << shift.min(ADAPTIVE_MAX_SCALE_SHIFT);
-    (
-        ((width / divisor) & !1).max(2),
-        ((height / divisor) & !1).max(2),
-    )
-}
-
+/// Run one bandwidth-control step and report any required encoder rebuild.
 ///
 /// `unchanged` says the surface is showing a frame the client already has.
 /// In that mode the controller stops rate-controlling — the budget it would
@@ -4327,11 +4205,6 @@ fn step_adaptive_bandwidth(
         .surface_subs
         .get(&surface_id)
         .is_some_and(|sub| sub.decoder_pressure_depth > SURFACE_DECODE_QUEUE_ALLOWANCE);
-    let encode_budget_us = surface_encode_budget_us(client, surface_id);
-    let encoder_backlogged = !unchanged
-        && client.surface_subs.get(&surface_id).is_some_and(|sub| {
-            sub.encode_work_us > encode_budget_us * ADAPTIVE_ENCODER_PRESSURE_RATIO
-        });
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let delivery_credit_limited = client.surface_goodput_sampled
         && client
@@ -4347,10 +4220,9 @@ fn step_adaptive_bandwidth(
         .surface_subs
         .get(&surface_id)
         .is_some_and(|sub| sub.credit_limited_at.is_some());
-    let delivery_congested = blocked_us.saturating_sub(client.write_blocked_us_seen)
+    let congested = blocked_us.saturating_sub(client.write_blocked_us_seen)
         > WRITE_BLOCKED_CONGESTED_US
         || decoder_backlogged;
-    let congested = delivery_congested || encoder_backlogged;
     let previous_congestion = client
         .surface_subs
         .get(&surface_id)
@@ -4359,9 +4231,8 @@ fn step_adaptive_bandwidth(
     let recovery_hold = !congested
         && previous_congestion.is_some_and(|at| now.duration_since(at) < ADAPTIVE_CONGESTION_HOLD);
     // Pressure evidence: the writer blocking on the socket, this surface's
-    // explicit WebCodecs queue growing, its encoder failing to produce an
-    // interactive cadence. ACK credit remains an admission bound, not a
-    // congestion signal: its capacity estimate is derived from the traffic
+    // explicit WebCodecs queue growing. ACK credit remains an admission bound,
+    // not a congestion signal: its capacity estimate is derived from the traffic
     // that same gate admitted, so interpreting a full credit window as path
     // pressure creates a closed feedback loop that can never discover spare
     // bandwidth. Raw ACK age and callback timing remain absent because both
@@ -4397,14 +4268,10 @@ fn step_adaptive_bandwidth(
     let held = AdaptiveStep {
         rebuild: false,
         quantizer: None,
-        target_changed: false,
     };
     let Some(sub) = client.surface_subs.get_mut(&surface_id) else {
         return held;
     };
-    if congested {
-        sub.adaptive_pressure_at = Some(now);
-    }
     let current = sub.adaptive_quantizer.unwrap_or(ceiling_q).max(ceiling_q);
     let motion_quantizer = sub.motion_quantizer.unwrap_or(ceiling_q).max(ceiling_q);
     let restore_motion = !unchanged && sub.still_quality_override;
@@ -4446,18 +4313,6 @@ fn step_adaptive_bandwidth(
         current
             .saturating_sub(ADAPTIVE_CREDIT_RECOVERY_STEP)
             .max(ceiling_q)
-    } else if encoder_backlogged && !delivery_congested {
-        // Cheaper bits do not make a CPU color conversion or encoder walk
-        // fewer pixels. Let the resolution arm below answer isolated encoder
-        // pressure; degrading quantization too would briefly make the smaller
-        // picture needlessly soft on an otherwise idle local link.
-        current
-    } else if sub.adaptive_scale_shift > 0 && current == ADAPTIVE_MAX_QUANTIZER {
-        // While resolution is adapted, spend spare bytes on probing a larger
-        // picture, not on making the small picture more expensive. If the
-        // source stops, the `unchanged` arm may still refine the image that
-        // will remain on screen.
-        current
     } else {
         next_quantizer(RateSample {
             ceiling: ceiling_q,
@@ -4493,60 +4348,7 @@ fn step_adaptive_bandwidth(
         sub.still_quality_override = false;
     }
 
-    let can_scale = sub.scaled_target.is_none() || sub.allow_adaptive_scale;
-    let pressure_scale_ready = sub
-        .scale_stepped_at
-        .is_none_or(|at| now.duration_since(at) >= ADAPTIVE_SCALE_BACKOFF_INTERVAL);
-    let recovery_scale_ready = sub
-        .scale_stepped_at
-        .is_none_or(|at| now.duration_since(at) >= ADAPTIVE_SCALE_RECOVERY_INTERVAL);
-    let mut target_changed = false;
-    let previous_shift = sub.adaptive_scale_shift;
-    if can_scale
-        && encoder_backlogged
-        && !delivery_congested
-        && pressure_scale_ready
-        && previous_shift < ADAPTIVE_MAX_SCALE_SHIFT
-    {
-        let additional = adaptive_scale_steps(sub.encode_work_us, encode_budget_us);
-        sub.adaptive_scale_shift = previous_shift
-            .saturating_add(additional)
-            .min(ADAPTIVE_MAX_SCALE_SHIFT);
-        target_changed = sub.adaptive_scale_shift != previous_shift;
-    } else if can_scale
-        && previous_shift > 0
-        && !congested
-        && !recovery_hold
-        && (unchanged || encoder_scale_recovery_has_headroom(sub.encode_work_us, encode_budget_us))
-        && recovery_scale_ready
-        && sub
-            .adaptive_pressure_at
-            .is_some_and(|at| now.duration_since(at) >= ADAPTIVE_SCALE_RECOVERY_INTERVAL)
-    {
-        sub.adaptive_scale_shift -= 1;
-        target_changed = true;
-    }
-    if target_changed {
-        sub.scale_stepped_at = Some(now);
-        let shift_delta = sub.adaptive_scale_shift.abs_diff(previous_shift);
-        let area_factor = 4f32.powi(i32::from(shift_delta));
-        if sub.adaptive_scale_shift > previous_shift {
-            sub.frame_bytes = (sub.frame_bytes / area_factor).max(1.0);
-            if sub.encode_work_us > 0.0 {
-                sub.encode_work_us = (sub.encode_work_us / area_factor).max(1.0);
-            }
-        } else {
-            sub.frame_bytes *= area_factor;
-            if sub.encode_work_us > 0.0 {
-                sub.encode_work_us *= area_factor;
-            }
-        }
-        sub.has_keyframe = false;
-        sub.last_encoded_gen = None;
-        sub.pending_encode = None;
-    }
-
-    if next == current && !target_changed {
+    if next == current {
         // Nothing moved.  Reporting a step anyway would be harmless for a
         // live surface (a redundant set to the rate already in effect) but
         // a still one reads it as "the picture improved" and spends a
@@ -4575,7 +4377,6 @@ fn step_adaptive_bandwidth(
     AdaptiveStep {
         rebuild,
         quantizer: Some(next),
-        target_changed,
     }
 }
 
@@ -4663,12 +4464,6 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let adaptive_q_log = adaptive_q.map_or(-1i32, |q| q as i32);
     let surface_write_blocked_total_ms =
         c.write_blocked_us.load(Ordering::Relaxed) as f64 / 1_000.0;
-    let adaptive_scale_divisor = 1u16
-        << c.surface_subs
-            .values()
-            .map(|s| s.adaptive_scale_shift)
-            .max()
-            .unwrap_or(0);
     let encode_jobs = sess.surface_encode_jobs.max(1) as u64;
     let encode_queue_avg_us = sess.surface_encode_queue_us / encode_jobs;
     let encode_work_avg_us = sess.surface_encode_work_us / encode_jobs;
@@ -4700,7 +4495,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s surface_goodput={surface_goodput_bps:.0}B/s surface_ack={surface_ack_ms:.1}ms surface_credit={surface_credit_used}/{surface_credit_limit}B jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} surface_write_blocked_total={surface_write_blocked_total_ms:.1}ms | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log} adaptive_scale=1/{adaptive_scale_divisor}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s surface_goodput={surface_goodput_bps:.0}B/s surface_ack={surface_ack_ms:.1}ms surface_credit={surface_credit_used}/{surface_credit_limit}B jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} surface_write_blocked_total={surface_write_blocked_total_ms:.1}ms | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.frame_requests,
@@ -5315,20 +5110,15 @@ fn invalidate_client_surface(client: &mut ClientState, surface_id: u16, destroye
     if still_subscribed && let Some(previous) = previous {
         let state = client.surface_subs.entry(surface_id).or_default();
         state.scaled_target = previous.scaled_target;
-        state.allow_adaptive_scale = previous.allow_adaptive_scale;
         state.max_fps = previous.max_fps;
         state.max_inflight_frames = previous.max_inflight_frames;
         state.frame_bytes = previous.frame_bytes;
-        state.encode_work_us = previous.encode_work_us;
         state.source_frame_interval_ms = previous.source_frame_interval_ms;
         state.adaptive_quantizer = previous.adaptive_quantizer;
         state.motion_quantizer = previous.motion_quantizer;
         state.still_quality_override = previous.still_quality_override;
         state.rate_stepped_at = previous.rate_stepped_at;
         state.congested_at = previous.congested_at;
-        state.adaptive_scale_shift = previous.adaptive_scale_shift;
-        state.scale_stepped_at = previous.scale_stepped_at;
-        state.adaptive_pressure_at = previous.adaptive_pressure_at;
     }
 
     let had_vulkan = client.vulkan_video_surfaces.remove(&surface_id).is_some();
@@ -10369,14 +10159,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     sub.selected_encoder = managed_source.map(|_| managed_preference);
                 }
                 let scaled = client.surface_subs.get(&sid).and_then(|s| s.scaled_target);
-                let adaptive_scale_shift = client
-                    .surface_subs
-                    .get(&sid)
-                    .map_or(0, |s| s.adaptive_scale_shift);
                 let view = scaled
                     .map(|(w, h)| (w, h, 120))
                     .or_else(|| client.surface_view_sizes.get(&sid).copied());
-                let target = Session::per_client_encode_target(
+                let (target_w, target_h) = Session::per_client_encode_target(
                     view,
                     native_w,
                     native_h,
@@ -10387,8 +10173,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     },
                     surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
-                let (target_w, target_h) =
-                    adaptive_surface_target(target.0, target.1, adaptive_scale_shift);
                 // A target under a hardware encoder's minimum extent would
                 // fall through the whole chain to the compositor-resident
                 // tier.  Grow it to the floor instead: a sidebar preview is
@@ -10603,18 +10387,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     now,
                     actually_still,
                 );
-                if step.rebuild || step.target_changed {
+                if step.rebuild {
                     let sub = client.surface_subs.entry(sid).or_default();
                     retire_encoder(sub.encoder.take());
                     if sub.encode_in_flight || sub.creation_in_flight {
                         sub.encoder_invalidated = true;
                     }
-                }
-                if step.target_changed {
-                    // `target_w` above belongs to the previous scale. Let the
-                    // next tick derive the new extent and perform the normal
-                    // compositor target / Vulkan-session replacement once.
-                    continue;
                 }
                 // A compositor-resident encoder takes the new rate from the
                 // next frame on — no rebuild, no keyframe.  This is only
@@ -11036,7 +10814,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     resize_destination
                         .filter(|_| needs_new_encoder)
                         .map(|(cw, ch, cs120)| {
-                            let target = Session::per_client_encode_target(
+                            let (w, h) = Session::per_client_encode_target(
                                 view,
                                 cw as u32,
                                 ch as u32,
@@ -11055,8 +10833,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 },
                                 surface_encode_cap(&state.config.surface_encoders, client, sid),
                             );
-                            let (w, h) =
-                                adaptive_surface_target(target.0, target.1, adaptive_scale_shift);
                             // Grown against the native the configure is
                             // heading for, exactly as the live target above
                             // was grown against the current one.  Comparing a
@@ -11726,15 +11502,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         }
                         needs_delivery_nudge = true;
                         continue;
-                    }
-
-                    // Keep encode pressure per subscription. Session-wide
-                    // counters below are reset after each diagnostics line,
-                    // and therefore cannot drive adaptation. Exclude the
-                    // first encode's driver warmup from steady-state work.
-                    if let Some(client) = sess.clients.get_mut(&result.cid) {
-                        let state = client.surface_subs.entry(result.sid).or_default();
-                        record_surface_encode_work(state, work_us);
                     }
 
                     let Some((nal_data, is_keyframe)) = result.nal_data else {
@@ -16609,7 +16376,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_pressure_never_adapts_resolution_at_the_quantizer_floor() {
+    fn delivery_pressure_preserves_view_extent_and_frame_at_the_quantizer_floor() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.display_fps = 120.0;
         client.rtt_ms = 50.0;
@@ -16621,7 +16388,8 @@ mod tests {
         sub.max_inflight_frames = Some(8);
         sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
         sub.scaled_target = Some((3_400, 2_424));
-        sub.allow_adaptive_scale = true;
+        sub.has_keyframe = true;
+        sub.last_encoded_gen = Some(7);
         client
             .write_blocked_us
             .store(WRITE_BLOCKED_CONGESTED_US + 1, Ordering::Relaxed);
@@ -16634,127 +16402,11 @@ mod tests {
             false,
         );
 
-        assert!(!step.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
-    }
-
-    #[test]
-    fn slow_encoder_adapts_resolution_on_an_idle_local_link() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 144.0;
-        let sid = 1;
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.frame_bytes = 1_000.0;
-        sub.encode_work_us = 240_000.0;
-        sub.scaled_target = Some((1_694, 2_078));
-        sub.allow_adaptive_scale = true;
-
-        let step = step_adaptive_bandwidth(
-            &mut client,
-            SurfaceBandwidth::Medium,
-            sid,
-            Instant::now(),
-            false,
-        );
-
-        assert!(step.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 2);
-        assert!(client.surface_subs[&sid].encode_work_us < 20_000.0);
-    }
-
-    #[test]
-    fn cold_encoder_start_does_not_blur_a_fast_surface() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 120.0;
-        let sid = 1;
-        let started = Instant::now();
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.scaled_target = Some((1918, 2108));
-        sub.allow_adaptive_scale = true;
-
-        for (i, work_us) in [450_000, 3_000, 2_000, 4_000].into_iter().enumerate() {
-            record_surface_encode_work(client.surface_subs.get_mut(&sid).unwrap(), work_us);
-            let step = step_adaptive_bandwidth(
-                &mut client,
-                SurfaceBandwidth::Ultra,
-                sid,
-                started + ADAPTIVE_STEP_INTERVAL * i as u32,
-                false,
-            );
-            assert!(
-                !step.target_changed,
-                "startup sample {i} reduced resolution"
-            );
-            assert!(
-                step.quantizer.is_none(),
-                "startup sample {i} reduced quality"
-            );
-            assert!(client.surface_subs[&sid].congested_at.is_none());
-        }
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
-    }
-
-    #[test]
-    fn a_recreated_encoder_does_not_inherit_a_cold_work_sample() {
-        let mut sub = SurfaceSubState::default();
-        record_surface_encode_work(&mut sub, 450_000);
-        assert_eq!(
-            accept_completed_creation(&mut sub),
-            EncoderCompletion::Accept
-        );
-        record_surface_encode_work(&mut sub, 450_000);
-        assert_eq!(sub.encode_work_us, 0.0);
-        record_surface_encode_work(&mut sub, 3_000);
-        assert_eq!(sub.encode_work_us, 3_000.0);
-    }
-
-    #[test]
-    fn alternating_slow_encodes_after_warmup_still_reduce_resolution() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 120.0;
-        let sid = 1;
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.scaled_target = Some((1918, 2108));
-        sub.allow_adaptive_scale = true;
-        for work_us in [450_000, 3_000, 240_000, 3_000, 240_000, 3_000] {
-            record_surface_encode_work(sub, work_us);
-        }
-        let step = step_adaptive_bandwidth(
-            &mut client,
-            SurfaceBandwidth::Ultra,
-            sid,
-            Instant::now(),
-            false,
-        );
-        assert!(step.target_changed);
-        assert!(client.surface_subs[&sid].adaptive_scale_shift > 0);
-    }
-
-    #[test]
-    fn sustained_slow_encoding_still_reduces_resolution_promptly() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 120.0;
-        let sid = 1;
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.scaled_target = Some((1918, 2108));
-        sub.allow_adaptive_scale = true;
-        record_surface_encode_work(sub, 240_000);
-        record_surface_encode_work(sub, 240_000);
-
-        let step = step_adaptive_bandwidth(
-            &mut client,
-            SurfaceBandwidth::Ultra,
-            sid,
-            Instant::now(),
-            false,
-        );
-        assert!(step.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 2);
-        assert_eq!(
-            step.quantizer,
-            Some(SurfaceBandwidth::Ultra.av1_quantizer() as u8)
-        );
-        assert!(client.surface_subs[&sid].adaptive_quantizer.is_none());
+        assert!(!step.rebuild);
+        let sub = &client.surface_subs[&sid];
+        assert_eq!(sub.scaled_target, Some((3_400, 2_424)));
+        assert!(sub.has_keyframe);
+        assert_eq!(sub.last_encoded_gen, Some(7));
     }
 
     #[test]
@@ -16800,79 +16452,6 @@ mod tests {
         );
         assert!(step.quantizer.is_some());
         assert!(client.surface_subs[&sid].congested_at.is_some());
-        assert!(!step.target_changed);
-    }
-
-    #[test]
-    fn encoder_scale_recovers_only_with_capacity_for_the_larger_extent() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 144.0;
-        let sid = 1;
-        let started = Instant::now();
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.frame_bytes = 1_000.0;
-        sub.encode_work_us = 15_000.0;
-        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
-        sub.adaptive_scale_shift = 2;
-        sub.scale_stepped_at = Some(started);
-        sub.adaptive_pressure_at = Some(started);
-        sub.scaled_target = Some((1_694, 2_078));
-        sub.allow_adaptive_scale = true;
-
-        let held = step_adaptive_bandwidth(
-            &mut client,
-            SurfaceBandwidth::Medium,
-            sid,
-            started + ADAPTIVE_SCALE_RECOVERY_INTERVAL,
-            false,
-        );
-        assert!(!held.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 2);
-
-        let sub = client.surface_subs.get_mut(&sid).unwrap();
-        sub.rate_stepped_at = None;
-        sub.encode_work_us = 5_000.0;
-        let recovered = step_adaptive_bandwidth(
-            &mut client,
-            SurfaceBandwidth::Medium,
-            sid,
-            started + ADAPTIVE_SCALE_RECOVERY_INTERVAL * 2,
-            false,
-        );
-        assert!(recovered.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 1);
-    }
-
-    #[test]
-    fn a_still_surface_recovers_its_full_resolution() {
-        let (mut client, _rx) = test_client_with_capacity(64);
-        client.display_fps = 120.0;
-        client.surface_goodput_bps = 10_000_000.0;
-        let sid = 1;
-        let started = Instant::now();
-        let sub = client.surface_subs.entry(sid).or_default();
-        sub.frame_bytes = 1_000.0;
-        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
-        sub.adaptive_scale_shift = ADAPTIVE_MAX_SCALE_SHIFT;
-        sub.scale_stepped_at = Some(started);
-        sub.adaptive_pressure_at = Some(started);
-        sub.scaled_target = Some((3_400, 2_424));
-        sub.allow_adaptive_scale = true;
-
-        for step in 1..=ADAPTIVE_MAX_SCALE_SHIFT {
-            let result = step_adaptive_bandwidth(
-                &mut client,
-                SurfaceBandwidth::Medium,
-                sid,
-                started + ADAPTIVE_SCALE_RECOVERY_INTERVAL * u32::from(step),
-                true,
-            );
-            assert!(result.target_changed);
-            assert_eq!(
-                client.surface_subs[&sid].adaptive_scale_shift,
-                ADAPTIVE_MAX_SCALE_SHIFT - step,
-            );
-        }
     }
 
     #[test]
@@ -16898,12 +16477,12 @@ mod tests {
             false,
         );
 
-        assert!(!step.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
+        assert!(!step.rebuild);
+        assert_eq!(client.surface_subs[&sid].scaled_target, Some((314, 176)));
     }
 
     #[test]
-    fn a_healthy_full_decoder_window_does_not_adapt_resolution() {
+    fn a_healthy_full_decoder_window_recovers_quality() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.display_fps = 120.0;
         client.rtt_ms = 50.0;
@@ -16926,16 +16505,7 @@ mod tests {
             false,
         );
 
-        assert!(!step.target_changed);
-        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
-    }
-
-    #[test]
-    fn adaptive_target_reduces_both_axes_and_keeps_encoder_parity() {
-        assert_eq!(adaptive_surface_target(3_400, 2_424, 0), (3_400, 2_424));
-        assert_eq!(adaptive_surface_target(3_400, 2_424, 1), (1_700, 1_212));
-        assert_eq!(adaptive_surface_target(3_400, 2_424, 3), (424, 302));
-        assert_eq!(adaptive_surface_target(2, 2, 3), (2, 2));
+        assert_eq!(step.quantizer, Some(ADAPTIVE_MAX_QUANTIZER - ADAPTIVE_STEP));
     }
 
     #[test]

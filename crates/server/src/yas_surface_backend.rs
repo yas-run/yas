@@ -613,7 +613,6 @@ pub(crate) async fn register(
     let sub = client.surface_subs.entry(surface_id).or_default();
     sub.codec_override = config.codec_support;
     sub.scaled_target = Some((config.width, config.height));
-    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
     sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.burst_remaining = SURFACE_BURST_FRAMES;
@@ -673,7 +672,6 @@ pub(crate) async fn configure(
     sub.pending_encode = None;
     sub.codec_override = config.codec_support;
     sub.scaled_target = Some((config.width, config.height));
-    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
     sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.nal_none_streak = 0;
@@ -1398,7 +1396,6 @@ mod tests {
                         "delay={delay}, batch={batch}, slots={slots}, peak_q={}",
                         outcome.peak_quantizer
                     );
-                    assert_eq!(sub.adaptive_scale_shift, 0);
                     assert!(sub.congested_at.is_none());
                     assert!(surface_ack_window_ms(client) >= delay as f32);
                     // A negotiated count window can cap cadence below 60 Hz.

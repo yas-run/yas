@@ -152,7 +152,6 @@ import {
   shouldPlaceObservedSurface,
   surfacePlacementIdentity,
 } from "./layout/surfacePlacement";
-import { isParkedTabDropTarget } from "./layout/tabGrouping";
 import {
   groupMusterPreviewResources,
   isMusterSession,
@@ -3954,8 +3953,6 @@ function WorkspaceScreen(props: {
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
-  let tabIntoPaneFn: ((value: string, sourcePaneId: string) => boolean) | null =
-    null;
   let openTabInPaneFn:
     | ((value: string, sourcePaneId: string) => boolean)
     | null = null;
@@ -4004,7 +4001,6 @@ function WorkspaceScreen(props: {
     focusBySessionFn = null;
     moveSessionToPaneFn = null;
     moveToPaneFn = null;
-    tabIntoPaneFn = null;
     openTabInPaneFn = null;
     openInContainerFn = null;
     splitPaneFn = null;
@@ -4026,44 +4022,6 @@ function WorkspaceScreen(props: {
     if (!moveToPaneFn) return false;
     moveToPaneFn(assignment, paneId);
     return true;
-  }
-
-  /** A pane grip landed on a tab-capable parked card. Keep the dragged pane
-   * as the visible tab and add that card beside it, instead of letting the
-   * sidebar's generic drop handler park the source. Parked surface previews
-   * are not hosts; a surface must be live in a pane to accept a drop. */
-  function tabDraggedPaneWithParked(
-    parkedAssignment: string,
-    draggedAssignment: string,
-    sourcePaneId: string,
-  ): void {
-    if (
-      !isParkedTabDropTarget(parkedAssignment) ||
-      parkedAssignment === draggedAssignment
-    ) {
-      return;
-    }
-    if (sourcePaneId === MAIN_PANE_SOURCE) {
-      if (inLayout() || mainViewDragAssignment() !== draggedAssignment) return;
-      // Queue before mounting LayoutContainer. It flushes in insertion order,
-      // so put the parked tab down first and the current view last: focus ends
-      // on the view the user dragged, with no visible content swap.
-      queueTilePlacement(parkedAssignment, "1");
-      queueTilePlacement(draggedAssignment, "0");
-      applyLayout(t("workspace.tabs"), {
-        type: "split",
-        direction: "tabs",
-        children: [
-          { node: { type: "leaf" }, weight: 1 },
-          { node: { type: "leaf" }, weight: 1 },
-        ],
-      });
-      return;
-    }
-    if (layoutAssignments()?.assignments[sourcePaneId] !== draggedAssignment) {
-      return;
-    }
-    tabIntoPaneFn?.(parkedAssignment, sourcePaneId);
   }
 
   /** Show a parked item without evicting a floating window already on screen. */
@@ -5733,12 +5691,6 @@ function WorkspaceScreen(props: {
                         if (moveToPaneFn === fn) moveToPaneFn = null;
                       };
                     }}
-                    onTabIntoPane={(fn) => {
-                      tabIntoPaneFn = fn;
-                      return () => {
-                        if (tabIntoPaneFn === fn) tabIntoPaneFn = null;
-                      };
-                    }}
                     onOpenTabInPane={(fn) => {
                       openTabInPaneFn = fn;
                       return () => {
@@ -5805,7 +5757,6 @@ function WorkspaceScreen(props: {
             <PreviewPanel
               parkDropActive={paneDragActive()}
               onParkDrop={parkDraggedAssignment}
-              onTabDrop={tabDraggedPaneWithParked}
               offScreenSessions={offScreenSessions()}
               allSessions={sessions()}
               surfaces={offScreenSurfaces()}
@@ -6481,7 +6432,8 @@ function WorkspaceScreen(props: {
           <div
             aria-hidden="true"
             style={{
-              height: "var(--yas-safe-area-bottom, env(safe-area-inset-bottom))",
+              height:
+                "var(--yas-safe-area-bottom, env(safe-area-inset-bottom))",
               "flex-shrink": 0,
               "background-color": theme().bg,
             }}
@@ -6548,48 +6500,12 @@ function PreviewPanel(props: {
   parkDropActive?: boolean;
   /** A grip drag landed here; park `assignment`, emptying `source`. */
   onParkDrop?: (assignment: string, source: string) => void;
-  /** A grip drag landed on a non-surface parked card; group both as tabs. */
-  onTabDrop?: (
-    parkedAssignment: string,
-    draggedAssignment: string,
-    source: string,
-  ) => void;
 }) {
   const [expandedId, setExpandedId] = createSignal<number | null>(null);
   const [resizeHover, setResizeHover] = createSignal(false);
   const [resizeActive, setResizeActive] = createSignal(false);
   /** The grip drag is hovering the panel (parallel to a pane's highlight). */
   const [parkOver, setParkOver] = createSignal(false);
-  const [tabDropActive, setTabDropActive] = createSignal(false);
-  let markedTabTarget: HTMLElement | null = null;
-  const cardAt = (event: DragEvent): HTMLElement | null => {
-    const origin = event.target;
-    if (!(origin instanceof Element)) return null;
-    const card = origin.closest<HTMLElement>("[data-yas-preview-assignment]");
-    const panel = event.currentTarget;
-    return card && panel instanceof HTMLElement && panel.contains(card)
-      ? card
-      : null;
-  };
-  const tabTargetAt = (event: DragEvent): HTMLElement | null => {
-    const card = cardAt(event);
-    const assignment = card?.dataset.yasPreviewAssignment;
-    return assignment && isParkedTabDropTarget(assignment) ? card : null;
-  };
-  const markTabTarget = (target: HTMLElement | null) => {
-    if (markedTabTarget === target) return;
-    if (markedTabTarget) {
-      markedTabTarget.style.removeProperty("outline");
-      markedTabTarget.style.removeProperty("outline-offset");
-    }
-    markedTabTarget = target;
-    if (target) {
-      target.style.setProperty("outline", `2px solid ${props.theme.accent}`);
-      target.style.setProperty("outline-offset", "-2px");
-    }
-    setTabDropActive(target != null);
-  };
-  onCleanup(() => markTabTarget(null));
   const resources = createMemo(() =>
     groupMusterPreviewResources(
       props.offScreenSessions,
@@ -6652,15 +6568,8 @@ function PreviewPanel(props: {
       }}
       onDragOver={(e) => {
         if (!props.onParkDrop || !isPaneDrag(e)) return;
-        const card = props.onTabDrop ? tabTargetAt(e) : null;
-        if (card?.dataset.yasPreviewAssignment) {
-          e.preventDefault();
-          e.dataTransfer!.dropEffect = "move";
-          setParkOver(false);
-          markTabTarget(card);
-          return;
-        }
-        markTabTarget(null);
+        // The whole sidebar receives parking drops, including its previews.
+        // Existing cards must not turn a parking gesture into tab grouping.
         e.preventDefault(); // allow the drop
         e.dataTransfer!.dropEffect = "move";
         if (!parkOver()) setParkOver(true);
@@ -6669,29 +6578,20 @@ function PreviewPanel(props: {
         // Ignore leaves into child elements; only clear when truly leaving.
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
           setParkOver(false);
-          markTabTarget(null);
         }
       }}
       onDrop={(e) => {
         setParkOver(false);
-        const card = props.onTabDrop ? tabTargetAt(e) : null;
-        const parkedAssignment = card?.dataset.yasPreviewAssignment;
         const assignment = tileDragAssignment(e);
         const source = paneDragSource(e);
-        markTabTarget(null);
-        if (parkedAssignment && assignment && source && props.onTabDrop) {
-          e.preventDefault();
-          e.stopPropagation();
-          props.onTabDrop(parkedAssignment, assignment, source);
-          return;
-        }
         if (assignment && source && props.onParkDrop) {
           e.preventDefault();
+          e.stopPropagation();
           props.onParkDrop(assignment, source);
         }
       }}
     >
-      <Show when={props.parkDropActive && !tabDropActive()}>
+      <Show when={props.parkDropActive}>
         <div
           style={{
             position: "absolute",
