@@ -1,6 +1,6 @@
 [package]
 name = "yas-composite-transport"
-version = "0.2.5"
+version = "0.2.6"
 edition.workspace = true
 description = "Bounded local pairing for YAS reliable streams and optional datagrams"
 license.workspace = true

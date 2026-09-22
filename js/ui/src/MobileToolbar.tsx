@@ -287,7 +287,10 @@ export function MobileToolbar(props: {
     if (terminal) {
       // This button explicitly pastes the device clipboard. A screenshot can
       // replace it without a DOM copy event, leaving remote ownership stale.
-      void terminal.pasteFromClipboard({ source: "browser", preferImage: true });
+      void terminal.pasteFromClipboard({
+        source: "browser",
+        preferImage: true,
+      });
       // Keep the keyboard up: some browsers move focus to the tapped button.
       terminal.focus();
       return;

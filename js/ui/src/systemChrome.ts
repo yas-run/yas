@@ -26,7 +26,8 @@ export function applySystemChrome(palette: TerminalPalette): void {
   // safe edges instead of reserving an extra blank anti-blur strip in the UI.
   const ios =
     (navigator as Navigator & { standalone?: boolean }).standalone === true ||
-    (typeof CSS !== "undefined" && CSS.supports("-webkit-touch-callout", "none"));
+    (typeof CSS !== "undefined" &&
+      CSS.supports("-webkit-touch-callout", "none"));
   let contained = false;
   if (standalone && ios) {
     const viewport = document.querySelector<HTMLMetaElement>(

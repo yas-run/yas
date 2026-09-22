@@ -18,9 +18,10 @@ function setup({ height = 700, cssHeight = 700, innerHeight = 874 } = {}) {
   vi.stubGlobal("visualViewport", viewport);
   vi.stubGlobal("innerHeight", innerHeight);
   let shellHeight = cssHeight;
-  vi.spyOn(document.documentElement, "getBoundingClientRect").mockImplementation(
-    () => new DOMRect(0, 0, viewport.width, shellHeight),
-  );
+  vi.spyOn(
+    document.documentElement,
+    "getBoundingClientRect",
+  ).mockImplementation(() => new DOMRect(0, 0, viewport.width, shellHeight));
   const changed = vi.fn();
   stop = observeWorkspaceViewport(changed);
   return {

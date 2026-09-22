@@ -104,10 +104,11 @@ describe("mobile toolbar Paste", () => {
       } = mount();
       usesWaylandClipboard.mockReturnValue(remoteOwned);
       const bytes = new Uint8Array([137, 80, 78, 71]);
-      const getType = vi.fn(async (mime: string) =>
-        new Blob([mime === "image/png" ? bytes : "old clipboard text"], {
-          type: mime,
-        }),
+      const getType = vi.fn(
+        async (mime: string) =>
+          new Blob([mime === "image/png" ? bytes : "old clipboard text"], {
+            type: mime,
+          }),
       );
       read.mockResolvedValue([{ types: ["text/plain", "image/png"], getType }]);
 
@@ -119,7 +120,9 @@ describe("mobile toolbar Paste", () => {
       expect(read).toHaveBeenCalledOnce();
       expect(getType).toHaveBeenCalledExactlyOnceWith("image/png");
       expect(sendClipboard).toHaveBeenCalledWith("image/png", bytes);
-      expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([0x16]);
+      expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+        0x16,
+      ]);
     },
   );
 
@@ -165,7 +168,9 @@ describe("mobile toolbar Paste", () => {
     let inTouchEnd = false;
     read.mockImplementation(() => {
       if (!inTouchEnd)
-        return Promise.reject(new DOMException("Tap required", "NotAllowedError"));
+        return Promise.reject(
+          new DOMException("Tap required", "NotAllowedError"),
+        );
       return Promise.resolve([
         {
           types: ["image/png"],
@@ -194,7 +199,9 @@ describe("mobile toolbar Paste", () => {
 
     commit();
     await vi.waitFor(() => expect(sendInput).toHaveBeenCalledOnce());
-    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([0x16]);
+    expect(Array.from(sendInput.mock.calls[0][1] as Uint8Array)).toEqual([
+      0x16,
+    ]);
     paste.dispatchEvent(
       new MouseEvent("click", {
         bubbles: true,
