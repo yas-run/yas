@@ -203,6 +203,11 @@ export const YAS_CORE_CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION = 4 as const;
 export const YAS_CORE_SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION = 1 as const;
 export const YAS_CORE_SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION = 2 as const;
 export const YAS_CORE_SERVER_HELLO_PLATFORM_EXTENSION = 3 as const;
+export const YAS_CORE_SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION = 4 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_PERSISTENT = 1 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_WASMI = 2 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_QUICKJS = 4 as const;
+export const YAS_CORE_EXTENSION_SUPPORT_COMMAND_PROVIDER = 8 as const;
 export const YAS_CORE_SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION = 1 as const;
 export const YAS_FAMILY_TRANSFER = 1 as const;
 export const YAS_TRANSFER_VERSION = 1 as const;
@@ -3185,6 +3190,26 @@ export const YAS_SCHEMA = {
         {
           "name": "SERVER_HELLO_PLATFORM_EXTENSION",
           "value": 3
+        },
+        {
+          "name": "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_PERSISTENT",
+          "value": 1
+        },
+        {
+          "name": "EXTENSION_SUPPORT_WASMI",
+          "value": 2
+        },
+        {
+          "name": "EXTENSION_SUPPORT_QUICKJS",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_COMMAND_PROVIDER",
+          "value": 8
         },
         {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",

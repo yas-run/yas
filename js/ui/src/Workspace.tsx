@@ -1,4 +1,5 @@
 import { TapButton } from "./TapButton";
+import { ExtensionOffers } from "./ExtensionOffers";
 import { createPointerDrag } from "./pointerDrag";
 import {
   createSignal,
@@ -5072,6 +5073,13 @@ function WorkspaceScreen(props: {
   const workspacePatchSequencer = new WorkspaceSessionPatchSequencer();
   let latestWorkspacePatchTarget: WorkspaceSessionBinding | null = null;
   let latestUiWorkspace = currentStoredWorkspace();
+  // Hydration may complete before the persistence effect's first run. Seed
+  // the queue from the saved document now, not from the first debounced edit:
+  // otherwise that edit becomes the baseline and is never sent to the server.
+  workspacePatchSequencer.reset(
+    props.workspaceSession ?? null,
+    initialSessionWorkspace ?? latestUiWorkspace,
+  );
   createEffect(() => {
     const binding = props.workspaceSession;
     const restoring = binding?.restoring() ?? true;
@@ -5102,14 +5110,27 @@ function WorkspaceScreen(props: {
       workspacePatchSequencer.submit(binding, next);
     }, WORKSPACE_SESSION_PATCH_DEBOUNCE_MS);
   });
-  onCleanup(() => {
+  const flushWorkspacePatch = () => {
     clearTimeout(workspacePatchTimer);
+    workspacePatchTimer = undefined;
     if (latestWorkspacePatchTarget) {
       workspacePatchSequencer.submit(
         latestWorkspacePatchTarget,
         latestUiWorkspace,
       );
     }
+  };
+  const flushHiddenWorkspace = () => {
+    if (document.visibilityState === "hidden") flushWorkspacePatch();
+  };
+  // A browser refresh does not dispose Solid owners. Send the latest edit
+  // before the page goes away rather than relying on the debounce or cleanup.
+  window.addEventListener("pagehide", flushWorkspacePatch);
+  document.addEventListener("visibilitychange", flushHiddenWorkspace);
+  onCleanup(() => {
+    window.removeEventListener("pagehide", flushWorkspacePatch);
+    document.removeEventListener("visibilitychange", flushHiddenWorkspace);
+    flushWorkspacePatch();
     workspacePatchSequencer.finishAfterDrain();
   });
 
@@ -5217,6 +5238,14 @@ function WorkspaceScreen(props: {
             />
           )}
         </Show>
+        <ExtensionOffers
+          workspace={workspace}
+          connections={wsState().connections}
+          readOnly={isConnectionReadOnly}
+          label={(id) => connectionLabels().get(id) ?? id}
+          palette={palette()}
+          fontSize={fontSize()}
+        />
         <PrefixMap
           palette={palette()}
           fontFamily={resolvedFontWithFallback()}

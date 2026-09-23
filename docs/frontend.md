@@ -33,6 +33,12 @@ are not empty server snapshots. Relay routes and product connections also stay
 in place during retries, so a home-link interruption does not rebuild every
 remote workspace.
 
+Workspace persistence starts from the restored server document, including when
+pane restoration completes synchronously. This keeps the first layout edit
+(such as tiling Manage) from being mistaken for an already-saved baseline.
+Pending debounced edits are flushed on page hide or when the document becomes
+hidden, as well as when switching away from the workspace.
+
 In iOS/iPadOS Safari tabs, a fixed opaque top strip helps
 suppress the system scroll-edge blur. It follows the palette, sits above
 workspace overlays, and is at least 11 CSS pixels tall: WebKit samples a 2px
@@ -54,6 +60,31 @@ with static, sticky, and unified opaque fixed headers. Enlarging the contained
 shell to the large viewport clipped the footer; `height=device-height` had no
 effect. Containment is the verified blur-free fallback, not a fix for WebKit's
 native scroll-edge effect or a way to reclaim its reserved top area.
+
+## Extension management
+
+Manage → Extensions runs actions independently per extension. Only the active
+extension's controls are disabled; other installs, updates, and controls remain
+available. Each row shows operation stages and its own result or error. Rows stay
+alphabetically ordered while installations complete, and the live server
+catalogue updates runtime phases without reloading the panel.
+
+After connecting, a compact, non-modal offer appears for viable missing or
+outdated extensions. Review it to install or update them together or individually.
+All eligible actions start selected; explicit deselections survive a recheck.
+Candidates with incomplete or failed checks remain visible with an explanation.
+The offer and Manage share compact, responsive rows, with digests and secondary
+controls behind Details, and share operation progress, including when the
+initiating panel closes. Dismissal is stored per browser connection target and
+server instance name; reconnects do not repeat it. New module digests, changed
+registry requirements, or advertised capabilities permit a new offer.
+
+Checks use registry requirements, negotiated families/operations, server runtime
+and persistence policy, and bounded read-only host probes. They distinguish
+available, available with limitations, unavailable, and unknown. Old registries
+or servers without the metadata produce unknown results and no automatic offer.
+Manage retains all entries and provides Recheck; unknown entries can still be
+installed manually. No extension is installed by a check.
 
 ## Render pipeline overview
 

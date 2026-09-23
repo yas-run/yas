@@ -325,6 +325,26 @@
           "value": 3
         },
         {
+          "name": "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_PERSISTENT",
+          "value": 1
+        },
+        {
+          "name": "EXTENSION_SUPPORT_WASMI",
+          "value": 2
+        },
+        {
+          "name": "EXTENSION_SUPPORT_QUICKJS",
+          "value": 4
+        },
+        {
+          "name": "EXTENSION_SUPPORT_COMMAND_PROVIDER",
+          "value": 8
+        },
+        {
           "name": "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION",
           "value": 1
         }

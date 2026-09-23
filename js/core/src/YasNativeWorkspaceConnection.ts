@@ -2251,6 +2251,12 @@ export class YasNativeWorkspaceConnection {
     return this.requireExtensionFacade().listExtensions();
   }
 
+  subscribeExtensions(
+    listener: (records: readonly YasExtensionRecord[] | null) => void,
+  ): () => void {
+    return this.requireExtensionFacade().subscribeExtensions(listener);
+  }
+
   installExtension(
     request: YasNativeExtensionInstallRequest,
   ): Promise<YasExtensionRecord> {

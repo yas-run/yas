@@ -352,6 +352,11 @@ pub const CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION: u64 = 4;
 pub const SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION: u64 = 1;
 pub const SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION: u64 = 2;
 pub const SERVER_HELLO_PLATFORM_EXTENSION: u64 = 3;
+pub const SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION: u64 = 4;
+pub const EXTENSION_SUPPORT_PERSISTENT: u64 = 1;
+pub const EXTENSION_SUPPORT_WASMI: u64 = 2;
+pub const EXTENSION_SUPPORT_QUICKJS: u64 = 4;
+pub const EXTENSION_SUPPORT_COMMAND_PROVIDER: u64 = 8;
 pub const SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION: u64 = 1;
 pub static OPERATIONS: &[super::OperationMetadata] = &[
 super::OperationMetadata { name: "HELLO", class: 1, kind: 0, direction: 0, sensitive: 0, compression: 2, datagram: 0, layout: "ClientHello; ResultPrefix + ServerHello" },
@@ -395,6 +400,11 @@ super::ConstantMetadata { name: "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION", valu
 super::ConstantMetadata { name: "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "SERVER_HELLO_PLATFORM_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "EXTENSION_SUPPORT_PERSISTENT", value: 1 },
+super::ConstantMetadata { name: "EXTENSION_SUPPORT_WASMI", value: 2 },
+super::ConstantMetadata { name: "EXTENSION_SUPPORT_QUICKJS", value: 4 },
+super::ConstantMetadata { name: "EXTENSION_SUPPORT_COMMAND_PROVIDER", value: 8 },
 super::ConstantMetadata { name: "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION", value: 1 },
 ];
 }

@@ -1954,6 +1954,23 @@ async fn serve_registered<S>(
                     .extension(yas_wire::schema::core::SERVER_HELLO_PLATFORM_EXTENSION as u16)
                     .expect("this build's platform triple is canonical"),
             ];
+            if negotiated.selected.contains(&family::EXTENSION) {
+                let mut support = yas_wire::schema::core::EXTENSION_SUPPORT_WASMI
+                    | yas_wire::schema::core::EXTENSION_SUPPORT_QUICKJS
+                    | yas_wire::schema::core::EXTENSION_SUPPORT_COMMAND_PROVIDER;
+                if services
+                    .app_state
+                    .as_ref()
+                    .is_some_and(|state| state.config.allow_persistent_extensions)
+                {
+                    support |= yas_wire::schema::core::EXTENSION_SUPPORT_PERSISTENT;
+                }
+                extensions.push(yas_wire::Extension {
+                    tag: yas_wire::schema::core::SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION as u16,
+                    required: false,
+                    value: (support as u32).to_le_bytes().to_vec(),
+                });
+            }
             if !negotiated.codecs.is_empty() {
                 extensions.push(
                     yas_wire::core::NegotiatedCodecs(negotiated.codecs.clone())
@@ -40211,6 +40228,47 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn extension_installation_support_matches_server_policy() {
+        for persistent in [false, true] {
+            let initial = super::super::tests::process_transport::test_state(
+                super::super::process::Server::new(false, true),
+            );
+            let mut inner = Arc::try_unwrap(initial).ok().expect("fresh test state");
+            inner.config.allow_persistent_extensions = persistent;
+            let (client, _, hello, task) = start_registered_session(
+                Arc::new(inner),
+                &[family::TRANSFER, family::CHANNEL, family::EXTENSION],
+            )
+            .await;
+            let support = hello
+                .extensions
+                .0
+                .iter()
+                .find(|extension| {
+                    extension.tag
+                        == yas_wire::schema::core::SERVER_HELLO_EXTENSION_SUPPORT_EXTENSION as u16
+                })
+                .expect("Extension support advertised");
+            assert!(!support.required);
+            let flags = u32::from_le_bytes(support.value.as_slice().try_into().unwrap());
+            assert_eq!(
+                flags & yas_wire::schema::core::EXTENSION_SUPPORT_PERSISTENT as u32 != 0,
+                persistent
+            );
+            assert_ne!(
+                flags & yas_wire::schema::core::EXTENSION_SUPPORT_WASMI as u32,
+                0
+            );
+            assert_ne!(
+                flags & yas_wire::schema::core::EXTENSION_SUPPORT_QUICKJS as u32,
+                0
+            );
+            drop(client);
+            task.await.unwrap();
+        }
+    }
+
     async fn start_registered_session(
         state: AppState,
         family_ids: &[u16],
