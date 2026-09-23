@@ -45,6 +45,7 @@ struct Repository {
     handle: yas_git::RepoHandle,
     object_algorithm: u8,
     revision: AtomicU64,
+    diagnostic_path: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,7 +191,7 @@ impl Runtime {
     }
 }
 
-fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
+pub(crate) fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
     let selection = options
         .status_selection
         .unwrap_or(yas_wire::schema::git::WATCH_STATUS_SELECTION_FLAGS as u8);
@@ -205,7 +206,25 @@ fn status_selection(options: &wire::WatchOptions) -> (bool, bool) {
     }
 }
 
-fn query_watch_state_options(body: &wire::QueryBody) -> yas_git::StateOptions {
+pub(crate) fn settle_delays(options: &wire::WatchOptions) -> (u16, u16) {
+    let defaults = yas_git::StateOptions::default();
+    let resolve = |value: u16, default: std::time::Duration| {
+        if value == 0 {
+            default.as_millis() as u16
+        } else {
+            value
+        }
+    };
+    (
+        resolve(options.refs_settle_ms, defaults.refs_latency),
+        resolve(options.status_settle_ms, defaults.status_latency),
+    )
+}
+
+fn query_watch_state_options(
+    body: &wire::QueryBody,
+    options: &wire::WatchOptions,
+) -> yas_git::StateOptions {
     // LOG depends on refs and operation pseudo-refs, plus the config files
     // that define upstreams and remotes. Those config files are watched
     // independently, so LOG does not need tracking/remotes records either.
@@ -213,11 +232,14 @@ fn query_watch_state_options(body: &wire::QueryBody) -> yas_git::StateOptions {
     // conservative invalidation source.
     let is_log = matches!(body, wire::QueryBody::Log { .. });
     let status = !is_log;
+    let (refs_ms, status_ms) = settle_delays(options);
     yas_git::StateOptions {
         wants_state: true,
         status,
         untracked: status,
         ignored: status,
+        refs_latency: std::time::Duration::from_millis(u64::from(refs_ms)),
+        status_latency: std::time::Duration::from_millis(u64::from(status_ms)),
         tracking: !is_log,
         remotes: !is_log,
         ..Default::default()
@@ -292,6 +314,11 @@ impl Session {
                 handle,
                 object_algorithm,
                 revision: AtomicU64::new(revision),
+                diagnostic_path: if canonical_worktree_path.is_empty() {
+                    canonical_git_dir.clone()
+                } else {
+                    canonical_worktree_path.clone()
+                },
             },
         );
         Ok(wire::OpenResult {
@@ -323,6 +350,10 @@ impl Session {
             .max(1))
     }
 
+    pub(crate) fn repository_path(&self, repository_handle: u64) -> Result<Vec<u8>, Error> {
+        Ok(self.repository(repository_handle)?.diagnostic_path.clone())
+    }
+
     pub(crate) fn cancel_token(&self) -> yas_git::Cancel {
         yas_git::Cancel::default()
     }
@@ -350,13 +381,7 @@ impl Session {
                     .map_err(|_| Error::invalid("Git ref prefix is not UTF-8"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let duration = |value: u16, default_ms: u64| {
-            std::time::Duration::from_millis(if value == 0 {
-                default_ms
-            } else {
-                u64::from(value)
-            })
-        };
+        let (refs_ms, status_ms) = settle_delays(options);
         let (untracked, ignored) = status_selection(options);
         let state_options = yas_git::StateOptions {
             wants_state: true,
@@ -366,8 +391,8 @@ impl Session {
             tracking: datasets & yas_wire::schema::git::WATCH_UPSTREAMS as u16 != 0,
             remotes: datasets & yas_wire::schema::git::WATCH_REMOTES as u16 != 0,
             ref_prefixes,
-            refs_latency: duration(options.refs_settle_ms, 50),
-            status_latency: duration(options.status_settle_ms, 500),
+            refs_latency: std::time::Duration::from_millis(u64::from(refs_ms)),
+            status_latency: std::time::Duration::from_millis(u64::from(status_ms)),
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let outbox: yas_git::native::StateSink =
@@ -416,8 +441,11 @@ impl Session {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let outbox: yas_git::native::StateSink =
             Box::new(move |event| sender.try_send(event).is_ok());
-        let handle =
-            repository_handle.start_native_state(query_watch_state_options(&request.body), outbox);
+        let options = request
+            .options()
+            .map_err(|_| Error::invalid("invalid Git query watch timing"))?;
+        let handle = repository_handle
+            .start_native_state(query_watch_state_options(&request.body, &options), outbox);
         Ok(QueryWatch {
             object_algorithm,
             repository: repository_handle,
@@ -609,6 +637,13 @@ impl Session {
 }
 
 impl Watch {
+    pub(crate) fn observe_events(
+        &self,
+        callback: Box<yas_fssync::backend::EventCallback>,
+    ) -> Option<yas_fssync::backend::EventObserver> {
+        Some(self.handle.observe_events(callback))
+    }
+
     pub(crate) async fn next(&mut self) -> Option<Result<WatchEvent, Error>> {
         match self.receiver.recv().await? {
             yas_git::native::StateEvent::Snapshot { state_id, records } => Some(
@@ -632,6 +667,13 @@ impl Watch {
 }
 
 impl QueryWatch {
+    pub(crate) fn observe_events(
+        &self,
+        callback: Box<yas_fssync::backend::EventCallback>,
+    ) -> Option<yas_fssync::backend::EventObserver> {
+        Some(self.handle.observe_events(callback))
+    }
+
     pub(crate) async fn next(&mut self) -> Option<QueryWatchUpdate> {
         let yas_git::native::StateEvent::Snapshot { state_id, .. } = self.receiver.recv().await?
         else {
@@ -2278,8 +2320,10 @@ mod tests {
             path: None,
             flags: yas_wire::schema::git::INDEX_STAGED as u16,
         });
-        let handle =
-            repository.start_native_state(query_watch_state_options(&request.body), outbox);
+        let handle = repository.start_native_state(
+            query_watch_state_options(&request.body, &wire::WatchOptions::default()),
+            outbox,
+        );
         let mut watch = QueryWatch {
             object_algorithm,
             repository,
@@ -2336,8 +2380,10 @@ mod tests {
             path: None,
             flags: 0,
         });
-        let handle =
-            repository.start_native_state(query_watch_state_options(&request.body), outbox);
+        let handle = repository.start_native_state(
+            query_watch_state_options(&request.body, &wire::WatchOptions::default()),
+            outbox,
+        );
         let mut watch = QueryWatch {
             object_algorithm: yas_wire::schema::git::OBJECT_SHA1 as u8,
             repository,

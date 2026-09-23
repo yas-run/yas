@@ -95,6 +95,11 @@ export interface YasGitWatchOptions {
   statusSelection?: number;
 }
 
+export type YasGitQueryWatchOptions = YasWatchOptions &
+  Pick<YasGitWatchOptions, "refsSettleMs" | "statusSettleMs"> & {
+    maxRecords?: number;
+  };
+
 export type YasGitQueryEndpoint =
   | { kind: "empty" }
   | { kind: "commit"; object: YasGitObjectId }
@@ -3642,7 +3647,7 @@ export class YasGitRepository {
   async watchQuery(
     body: YasGitQueryBody,
     onUpdate: (update: YasGitWatchedQueryUpdate) => void,
-    options: YasWatchOptions & { maxRecords?: number } = {},
+    options: YasGitQueryWatchOptions = {},
   ): Promise<YasGitWatchedQuery> {
     this.assertOpen();
     const operation = YasGitWatchedQuery.open(
@@ -3778,7 +3783,7 @@ export class YasGitWatchedQuery {
     repository: YasGitRepository,
     body: YasGitQueryBody,
     onUpdate: (update: YasGitWatchedQueryUpdate) => void,
-    options: YasWatchOptions & { maxRecords?: number },
+    options: YasGitQueryWatchOptions,
   ): Promise<YasGitWatchedQuery> {
     const preferred = options.initialCredit ?? 1024n * 1024n;
     const lease = repository.client.connection.receiveBudget.reserve(
@@ -3793,7 +3798,19 @@ export class YasGitWatchedQuery {
           repository.handle,
           options.maxRecords ?? 0,
           body,
-          encodeWatch(options, lease.bytes),
+          encodeWatch(
+            {
+              ...options,
+              extensions: [
+                ...(options.extensions ?? []),
+                ...encodeGitWatchOptions({
+                  refsSettleMs: options.refsSettleMs,
+                  statusSettleMs: options.statusSettleMs,
+                }),
+              ],
+            },
+            lease.bytes,
+          ),
         ),
         (payload) => {
           const result = decodeWatchResult(payload);

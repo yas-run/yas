@@ -190,6 +190,9 @@ export interface GitRequestOptions {
 export interface GitLogWatchOptions {
   flags?: number;
   limit?: number;
+  /** Zero uses the server default; otherwise 1..65535 milliseconds. */
+  refsLatencyMs?: number;
+  statusLatencyMs?: number;
 }
 
 export function gitStatusText(status: number): string {

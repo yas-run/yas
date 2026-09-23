@@ -1015,6 +1015,11 @@ pub const ORIGIN_EXTENSION: u64 = 5;
 pub const ACTIVE_SUBSCRIPTIONS_EXTENSION: u64 = 1;
 pub const BANDWIDTH_RATES_EXTENSION: u64 = 2;
 pub const AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION: u64 = 3;
+pub const AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION: u64 = 4;
+pub const GIT_WATCH_UNTRACKED: u64 = 65536;
+pub const GIT_WATCH_IGNORED: u64 = 131072;
+pub const GIT_QUERY_WATCH: u64 = 2147483648;
+pub const GIT_QUERY_KIND_SHIFT: u64 = 16;
 pub const MAX_ACTIVE_SUBSCRIPTIONS: u64 = 4096;
 pub const MAX_PUBLISHED_CLIENTS: u64 = 4096;
 pub const LIMIT_MAX_PUBLISHED_CLIENTS: u64 = 1;
@@ -1036,7 +1041,8 @@ super::TypeMetadata { name: "origin_webrtc", layout: "peer_id:string_u16" },
 super::TypeMetadata { name: "origin_extension", layout: "extension_id:u64,definition_revision:u64,attempt:u64,task_id:u32,name:string_u16" },
 super::TypeMetadata { name: "active_subscriptions", layout: "terminal_count:u16,surface_count:u16,aux_count:u16,reserved:u16=0; repeated terminal_handle:u64,view_id:u32,rows:u16,cols:u16; repeated surface_handle:u64,view_id:u32,width:u32,height:u32,scale_120:u16,reserved:u16=0; repeated family:u16,reserved:u16=0,subscription_id:u32,resource_handle:u64; each section strictly key-sorted" },
 super::TypeMetadata { name: "bandwidth_rates", layout: "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord" },
-super::TypeMetadata { name: "auxiliary_subscription_details", layout: "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags" },
+super::TypeMetadata { name: "auxiliary_subscription_details", layout: "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags" },
+super::TypeMetadata { name: "auxiliary_subscription_timings", layout: "ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
@@ -1053,6 +1059,11 @@ super::ConstantMetadata { name: "ORIGIN_EXTENSION", value: 5 },
 super::ConstantMetadata { name: "ACTIVE_SUBSCRIPTIONS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "BANDWIDTH_RATES_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "AUXILIARY_SUBSCRIPTION_TIMINGS_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "GIT_WATCH_UNTRACKED", value: 65536 },
+super::ConstantMetadata { name: "GIT_WATCH_IGNORED", value: 131072 },
+super::ConstantMetadata { name: "GIT_QUERY_WATCH", value: 2147483648 },
+super::ConstantMetadata { name: "GIT_QUERY_KIND_SHIFT", value: 16 },
 super::ConstantMetadata { name: "MAX_ACTIVE_SUBSCRIPTIONS", value: 4096 },
 super::ConstantMetadata { name: "MAX_PUBLISHED_CLIENTS", value: 4096 },
 super::ConstantMetadata { name: "LIMIT_MAX_PUBLISHED_CLIENTS", value: 1 },
@@ -2829,6 +2840,7 @@ pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "object_id", layout: "algorithm:u8,byte_len:u8,reserved:u16=0,bytes:[u8;byte_len]; SHA1 requires 20 bytes and SHA256 requires 32 bytes; zero bytes are not a sentinel" },
 super::TypeMetadata { name: "repository_source", layout: "kind:u8,reserved:[u8;3]=0; PLATFORM_PATH path:bytes_u32 raw platform bytes; FS root_handle:u64,path:bytes_u32 containing FS WirePath; SUBMODULE parent_repository:u64,path:bytes_u32 containing non-root FS WirePath; TERMINAL_CWD terminal_handle:u64,suffix:bytes_u32 containing relative FS WirePath, resolved atomically from that terminal's live cwd" },
 super::TypeMetadata { name: "watch_options", layout: "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref" },
+super::TypeMetadata { name: "query_watch_options", layout: "WATCH_QUERY StateWatch Extensions accept WATCH_REFS_SETTLE_MS_EXTENSION and WATCH_STATUS_SETTLE_MS_EXTENSION with WATCH zero/default semantics; ref/status selection is query-derived" },
 super::TypeMetadata { name: "watch_status_selection", layout: "Additional optional Git WATCH StateWatch extension: tag WATCH_STATUS_SELECTION_EXTENSION, REQUIRED clear, value exactly one u8 of flags admitting WATCH_STATUS_UNTRACKED and WATCH_STATUS_IGNORED in addition to tracked status; unknown bits are invalid and IGNORED requires UNTRACKED, so valid values are 0, 1, and 3. Absence admits both classes for compatibility; selection only applies with the WATCH_STATUS dataset and is enforced before collection budgets. Older servers may ignore this optional extension" },
 super::TypeMetadata { name: "query_endpoint", layout: "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint" },
 super::TypeMetadata { name: "query_cursor", layout: "empty bytes mean START; otherwise kind:u8,reserved:[u8;3]=0 and variant body: LOG_FRONTIER count:u16,reserved:u16=0,repeated ObjectId; PATH path:bytes_u32 containing FS WirePath; PLATFORM_PATH path:bytes_u32 raw platform bytes; PATCH path:bytes_u32 containing FS WirePath,position:u64; POSITION position:u64. Cursors are emitted by the server and replayed unchanged, but their exact form permits faithful protocol adaptation" },
@@ -4450,6 +4462,28 @@ pub const EVENT_OUTBOX_QUEUE: u64 = 44;
 pub const EVENT_SUPERVISOR: u64 = 45;
 pub const EVENT_CONNECTION_ACCEPT: u64 = 46;
 pub const EVENT_SERVER_ERROR: u64 = 47;
+pub const EVENT_GIT_WATCH_START: u64 = 48;
+pub const EVENT_GIT_WATCH_STOP: u64 = 49;
+pub const EVENT_GIT_STATE: u64 = 50;
+pub const EVENT_GIT_RECORD: u64 = 51;
+pub const EVENT_GIT_FS_EVENT: u64 = 52;
+pub const EVENT_FS_RECORD: u64 = 53;
+pub const EVENT_FS_EVENT: u64 = 54;
+pub const EVENT_FS_WATCH_START: u64 = 55;
+pub const EVENT_FS_WATCH_STOP: u64 = 56;
+pub const EVENT_FS_STATE: u64 = 57;
+pub const EVENT_NATIVE_FRAME_READ: u64 = 58;
+pub const EVENT_NATIVE_FRAME_WRITE: u64 = 59;
+pub const EVENT_NATIVE_PAYLOAD_READ: u64 = 60;
+pub const EVENT_NATIVE_PAYLOAD_WRITE: u64 = 61;
+pub const EVENT_NATIVE_STATE_RECORD_READ: u64 = 62;
+pub const EVENT_NATIVE_STATE_RECORD_WRITE: u64 = 63;
+pub const EVENT_NATIVE_CONNECT: u64 = 64;
+pub const EVENT_NATIVE_DISCONNECT: u64 = 65;
+pub const EVENT_NATIVE_ERROR: u64 = 66;
+pub const EVENT_NATIVE_DATAGRAM_READ: u64 = 67;
+pub const EVENT_NATIVE_DATAGRAM_WRITE: u64 = 68;
+pub const EVENT_NATIVE_DATAGRAM_DROP: u64 = 69;
 pub const MIN_RING_BYTES: u64 = 4096;
 pub const MAX_RING_BYTES: u64 = 67104768;
 pub const DEFAULT_RING_BYTES: u64 = 1048576;
@@ -4562,6 +4596,28 @@ super::ConstantMetadata { name: "EVENT_OUTBOX_QUEUE", value: 44 },
 super::ConstantMetadata { name: "EVENT_SUPERVISOR", value: 45 },
 super::ConstantMetadata { name: "EVENT_CONNECTION_ACCEPT", value: 46 },
 super::ConstantMetadata { name: "EVENT_SERVER_ERROR", value: 47 },
+super::ConstantMetadata { name: "EVENT_GIT_WATCH_START", value: 48 },
+super::ConstantMetadata { name: "EVENT_GIT_WATCH_STOP", value: 49 },
+super::ConstantMetadata { name: "EVENT_GIT_STATE", value: 50 },
+super::ConstantMetadata { name: "EVENT_GIT_RECORD", value: 51 },
+super::ConstantMetadata { name: "EVENT_GIT_FS_EVENT", value: 52 },
+super::ConstantMetadata { name: "EVENT_FS_RECORD", value: 53 },
+super::ConstantMetadata { name: "EVENT_FS_EVENT", value: 54 },
+super::ConstantMetadata { name: "EVENT_FS_WATCH_START", value: 55 },
+super::ConstantMetadata { name: "EVENT_FS_WATCH_STOP", value: 56 },
+super::ConstantMetadata { name: "EVENT_FS_STATE", value: 57 },
+super::ConstantMetadata { name: "EVENT_NATIVE_FRAME_READ", value: 58 },
+super::ConstantMetadata { name: "EVENT_NATIVE_FRAME_WRITE", value: 59 },
+super::ConstantMetadata { name: "EVENT_NATIVE_PAYLOAD_READ", value: 60 },
+super::ConstantMetadata { name: "EVENT_NATIVE_PAYLOAD_WRITE", value: 61 },
+super::ConstantMetadata { name: "EVENT_NATIVE_STATE_RECORD_READ", value: 62 },
+super::ConstantMetadata { name: "EVENT_NATIVE_STATE_RECORD_WRITE", value: 63 },
+super::ConstantMetadata { name: "EVENT_NATIVE_CONNECT", value: 64 },
+super::ConstantMetadata { name: "EVENT_NATIVE_DISCONNECT", value: 65 },
+super::ConstantMetadata { name: "EVENT_NATIVE_ERROR", value: 66 },
+super::ConstantMetadata { name: "EVENT_NATIVE_DATAGRAM_READ", value: 67 },
+super::ConstantMetadata { name: "EVENT_NATIVE_DATAGRAM_WRITE", value: 68 },
+super::ConstantMetadata { name: "EVENT_NATIVE_DATAGRAM_DROP", value: 69 },
 super::ConstantMetadata { name: "MIN_RING_BYTES", value: 4096 },
 super::ConstantMetadata { name: "MAX_RING_BYTES", value: 67104768 },
 super::ConstantMetadata { name: "DEFAULT_RING_BYTES", value: 1048576 },

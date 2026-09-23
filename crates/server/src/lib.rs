@@ -56,6 +56,7 @@ mod kv;
 #[cfg(target_os = "linux")]
 mod media_input;
 mod media_policy;
+mod native_diagnostics;
 mod net;
 #[cfg(target_os = "linux")]
 mod nvdec_decode;
@@ -81,6 +82,7 @@ mod vaapi_encode;
 mod video_decode;
 #[cfg(target_os = "linux")]
 mod video_decode_vulkan;
+mod watch_diagnostics;
 #[cfg(target_os = "linux")]
 mod xwayland;
 mod yas;
@@ -131,6 +133,8 @@ macro_rules! yas_event {
         }
     }};
 }
+
+pub(crate) use yas_event;
 
 tokio::task_local! {
     static EVENT_WRITE_CONTEXT: (Arc<events::EventLog>, Arc<AtomicU64>);
@@ -969,6 +973,7 @@ struct NativeYasSubscriptions {
 struct NativeYasSubscriptionSnapshot {
     active: yas_wire::client::ActiveSubscriptions,
     auxiliary_details: yas_wire::client::AuxiliarySubscriptionDetails,
+    auxiliary_timings: yas_wire::client::AuxiliarySubscriptionTimings,
 }
 
 impl NativeYasSubscriptions {

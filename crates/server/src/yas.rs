@@ -2024,6 +2024,16 @@ async fn serve_registered<S>(
         });
     let native_inbound_bytes = Arc::new(AtomicU64::new(0));
     let native_outbound_bytes = Arc::new(AtomicU64::new(0));
+    let mut connection_journal = services.app_state.as_ref().map(|state| {
+        super::native_diagnostics::ConnectionJournal::new(
+            state.events.clone(),
+            negotiated.session_id,
+            &hello.client_name,
+            &hello.client_release,
+            native_inbound_bytes.clone(),
+            native_outbound_bytes.clone(),
+        )
+    });
     let native_active_subscriptions = Arc::new(NativeYasSubscriptions::default());
     let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel(1);
     let native_client_registered = registration.is_some() && services.app_state.is_some();
@@ -2109,6 +2119,11 @@ async fn serve_registered<S>(
     let writer_cancel = cancellation.clone();
     let writer_codec = negotiated.outbound_codec.clone();
     let writer_bytes = Arc::clone(&native_outbound_bytes);
+    let frame_journal_session = negotiated.session_id;
+    let writer_journal = services
+        .app_state
+        .as_ref()
+        .map(|state| state.events.clone());
     #[cfg(test)]
     let terminal_writer_gate = services.terminal_writer_gate.clone();
     #[cfg(test)]
@@ -2154,8 +2169,14 @@ async fn serve_registered<S>(
                 }
                 continue;
             }
-            let Ok(encoded) = writer_codec.encode_stream(&queued.frame) else {
-                break;
+            let encoded = match writer_codec.encode_stream(&queued.frame) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    if let Some(log) = &writer_journal {
+                        log.native_error(&frame_journal_session, "encode", &error);
+                    }
+                    break;
+                }
             };
             if queued
                 .terminal_guard
@@ -2168,7 +2189,10 @@ async fn serve_registered<S>(
                 continue;
             }
             let write_started = Instant::now();
-            if writer.write_all(&encoded).await.is_err() {
+            if let Err(error) = writer.write_all(&encoded).await {
+                if let Some(log) = &writer_journal {
+                    log.native_error(&frame_journal_session, "write", &error);
+                }
                 break;
             }
             queued.record_write_duration(write_started.elapsed());
@@ -2176,6 +2200,14 @@ async fn serve_registered<S>(
                 guard.commit();
             }
             writer_bytes.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+            if let Some(log) = &writer_journal {
+                log.native_frame(
+                    super::events::EventType::NativeFrameWrite,
+                    &frame_journal_session,
+                    &queued.frame,
+                    encoded.len() as u64,
+                );
+            }
             if let Some(written) = queued.written.take() {
                 let _ = written.send(tokio::time::Instant::now());
             }
@@ -2210,6 +2242,10 @@ async fn serve_registered<S>(
     let reader_budget = Arc::clone(&inbound_credit);
     let reader_transfers = Arc::clone(&inbound_transfers);
     let reader_bytes = Arc::clone(&native_inbound_bytes);
+    let reader_journal = services
+        .app_state
+        .as_ref()
+        .map(|state| state.events.clone());
     let reader_task = tokio::spawn(async move {
         loop {
             let queued = tokio::select! {
@@ -2221,15 +2257,36 @@ async fn serve_registered<S>(
                     &reader_cancel,
                 ) => match result {
                     Ok(Some(queued)) => queued,
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => break,
+                    Err(error) => {
+                        if let Some(log) = &reader_journal { log.native_error(&frame_journal_session, "read", &error); }
+                        break;
+                    }
                 },
                 _ = reader_cancel.cancelled() => break,
             };
             reader_bytes.fetch_add(queued.wire_bytes, Ordering::Relaxed);
+            if let Some(log) = &reader_journal {
+                log.native_frame(
+                    super::events::EventType::NativeFrameRead,
+                    &frame_journal_session,
+                    &queued.frame,
+                    queued.wire_bytes,
+                );
+            }
             match reader_heartbeat.receive(&queued.frame) {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(()) => break,
+                Err(()) => {
+                    if let Some(log) = &reader_journal {
+                        log.native_error(
+                            &frame_journal_session,
+                            "heartbeat",
+                            &"invalid heartbeat response",
+                        );
+                    }
+                    break;
+                }
             }
             if in_tx.send(queued).await.is_err() {
                 break;
@@ -2587,6 +2644,9 @@ async fn serve_registered<S>(
         _ = heartbeat.run(&heartbeat_out, ping_interval) => "Core Ping deadline exceeded".to_owned(),
     };
     eprintln!("native YAS session exit: {exit_reason}");
+    if let Some(journal) = &mut connection_journal {
+        journal.reason = exit_reason;
+    }
     session.native_active_subscriptions.clear();
     cancellation.cancel();
     reader_task.abort();
@@ -3091,6 +3151,7 @@ enum FsOperationOutcome {
     Open(Result<yas_fs_wire::OpenResult, super::yas_fs::Error>),
     Watch {
         initial_credit: u64,
+        request: yas_fs_wire::Watch,
         outcome: Result<super::yas_fs::Watch, super::yas_fs::Error>,
     },
     Fetch {
@@ -5241,6 +5302,14 @@ async fn client_catalogue_snapshot(
                     .expect("validated native Client subscription details"),
             );
         }
+        if !subscription_snapshot.auxiliary_timings.entries.is_empty() {
+            subscription_extensions.push(
+                subscription_snapshot
+                    .auxiliary_timings
+                    .extension()
+                    .expect("validated native Client watch timings"),
+            );
+        }
         let extensions = Extensions(subscription_extensions);
         records.insert(
             session_id,
@@ -6460,6 +6529,7 @@ struct Watcher {
     task: tokio::task::JoinHandle<()>,
     terminal_updates: Option<tokio::sync::watch::Sender<TerminalCatalogue>>,
     kv: Option<KvWatcher>,
+    diagnostics: Option<Arc<super::watch_diagnostics::WatchInfo>>,
 }
 
 #[derive(Clone, Copy)]
@@ -7137,6 +7207,11 @@ impl Session {
             .watchers
             .iter()
             .filter_map(|(&subscription_id, watcher)| {
+                if let Some(info) = &watcher.diagnostics {
+                    return retained_auxiliary
+                        .contains(&(watcher.family, subscription_id))
+                        .then(|| info.detail.clone());
+                }
                 let detail = watcher.kv?;
                 retained_auxiliary
                     .contains(&(family::KV, subscription_id))
@@ -7158,13 +7233,42 @@ impl Session {
             })
             .collect::<Vec<_>>();
         auxiliary_details.sort_unstable_by_key(|entry| (entry.family, entry.subscription_id));
+        let mut timings = self
+            .watchers
+            .iter()
+            .filter_map(|(&id, watcher)| {
+                let info = watcher.diagnostics.as_ref()?;
+                retained_auxiliary
+                    .contains(&(watcher.family, id))
+                    .then(|| info.timing.clone())
+            })
+            .collect::<Vec<_>>();
+        timings.sort_unstable_by_key(|entry| (entry.family, entry.subscription_id));
         self.native_active_subscriptions
             .replace(super::NativeYasSubscriptionSnapshot {
                 active,
                 auxiliary_details: yas_client::AuxiliarySubscriptionDetails {
                     entries: auxiliary_details,
                 },
+                auxiliary_timings: yas_client::AuxiliarySubscriptionTimings { entries: timings },
             });
+    }
+
+    fn watch_journal(
+        &self,
+        info: Arc<super::watch_diagnostics::WatchInfo>,
+        observe: impl FnOnce(
+            Box<yas_fssync::backend::EventCallback>,
+        ) -> Option<yas_fssync::backend::EventObserver>,
+    ) -> Option<super::watch_diagnostics::WatchJournal> {
+        self.services.app_state.as_ref().map(|state| {
+            super::watch_diagnostics::WatchJournal::start(
+                state.events.clone(),
+                self.negotiated.session_id,
+                info,
+                observe,
+            )
+        })
     }
 
     async fn handle_shutdown_notice(&self, notice: ShutdownNotice) -> Result<(), ()> {
@@ -7446,11 +7550,25 @@ impl Session {
         else {
             return DatagramAttempt::ReliableFallback;
         };
-        match sender.try_send(encoded) {
+        let wire_bytes = encoded.len() as u64;
+        let attempt = match sender.try_send(encoded) {
             Ok(()) => DatagramAttempt::Sent,
             Err(_) if sender.is_closed() => DatagramAttempt::ReliableFallback,
             Err(_) => DatagramAttempt::Dropped,
+        };
+        let kind = match attempt {
+            DatagramAttempt::Sent => Some(super::events::EventType::NativeDatagramWrite),
+            DatagramAttempt::Dropped => Some(super::events::EventType::NativeDatagramDrop),
+            DatagramAttempt::ReliableFallback => None,
+        };
+        if let Some(kind) = kind
+            && let Some(state) = &self.services.app_state
+        {
+            state
+                .events
+                .native_frame(kind, &self.negotiated.session_id, frame, wire_bytes);
         }
+        attempt
     }
 
     #[cfg(target_os = "linux")]
@@ -7485,6 +7603,14 @@ impl Session {
         let Ok(probe) = self.negotiated.inbound_codec.decode(&bytes) else {
             return;
         };
+        if let Some(state) = &self.services.app_state {
+            state.events.native_frame(
+                super::events::EventType::NativeDatagramRead,
+                &self.negotiated.session_id,
+                &probe,
+                bytes.len() as u64,
+            );
+        }
         if probe.header.class != Class::Event {
             return;
         }
@@ -8460,6 +8586,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         self.native
@@ -8989,6 +9116,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         self.native
@@ -10399,6 +10527,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -11830,6 +11959,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -12521,6 +12651,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -14166,6 +14297,7 @@ impl Session {
                 task,
                 terminal_updates: Some(updates),
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -15559,6 +15691,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -15637,6 +15770,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -16230,6 +16364,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
+                diagnostics: None,
                 kv: Some(KvWatcher {
                     namespace_handle: request.namespace_handle,
                     state_watch_flags,
@@ -17891,6 +18026,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -18536,9 +18672,11 @@ impl Session {
                 let (semantic_id, semantic_slot) =
                     semantic_admission.expect("FS WATCH is a semantic operation");
                 let task = tokio::spawn(async move {
+                    let outcome = service.watch(&request).await;
                     let outcome = FsOperationOutcome::Watch {
                         initial_credit,
-                        outcome: service.watch(&request).await,
+                        request,
+                        outcome,
                     };
                     let _ = internal
                         .send(Internal::FsOperationComplete {
@@ -19229,6 +19367,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         self.lsp
@@ -19767,6 +19906,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -20283,6 +20423,15 @@ impl Session {
                 .await;
         }
         self.send_sensitive_result(&frame, Status::Ok, body).await?;
+        let info = Arc::new(super::watch_diagnostics::WatchInfo::state(
+            subscription_id,
+            &request,
+            &options,
+            session
+                .repository_path(request.repository_handle)
+                .map_err(|_| ())?,
+        ));
+        let journal = self.watch_journal(info.clone(), |callback| watch.observe_events(callback));
         let task = tokio::spawn(run_git_watch(
             subscription_id,
             current_revision,
@@ -20291,6 +20440,7 @@ impl Session {
             Arc::clone(&control),
             self.out.clone(),
             self.cancellation.clone(),
+            journal,
         ));
         self.watchers.insert(
             subscription_id,
@@ -20300,6 +20450,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: Some(info),
             },
         );
         self.git
@@ -20319,7 +20470,7 @@ impl Session {
                     .await;
             }
         };
-        if has_unknown_required(&request.state.extensions, &[]) {
+        if request.options().is_err() {
             return self
                 .send_sensitive_result(&frame, Status::Unsupported, Vec::new())
                 .await;
@@ -20387,6 +20538,14 @@ impl Session {
                 .await;
         }
         self.send_sensitive_result(&frame, Status::Ok, body).await?;
+        let info = Arc::new(super::watch_diagnostics::WatchInfo::query(
+            subscription_id,
+            &request,
+            session
+                .repository_path(request.repository_handle)
+                .map_err(|_| ())?,
+        ));
+        let journal = self.watch_journal(info.clone(), |callback| watch.observe_events(callback));
         let task = tokio::spawn(run_git_query_watch(
             subscription_id,
             watch,
@@ -20394,6 +20553,7 @@ impl Session {
             Arc::clone(&control),
             self.out.clone(),
             self.cancellation.clone(),
+            journal,
         ));
         self.watchers.insert(
             subscription_id,
@@ -20403,6 +20563,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: Some(info),
             },
         );
         self.git
@@ -21417,6 +21578,7 @@ impl Session {
                 task,
                 terminal_updates: None,
                 kv: None,
+                diagnostics: None,
             },
         );
         Ok(())
@@ -24715,6 +24877,7 @@ impl Session {
             },
             FsOperationOutcome::Watch {
                 initial_credit,
+                request,
                 outcome,
             } => {
                 let watch = match outcome {
@@ -24794,6 +24957,20 @@ impl Session {
                     true,
                 )
                 .await?;
+                let path = self
+                    .fs
+                    .as_ref()
+                    .ok_or(())?
+                    .session
+                    .root_path(root_handle)
+                    .map_err(|_| ())?;
+                let info = Arc::new(super::watch_diagnostics::WatchInfo::fs(
+                    subscription_id,
+                    &request,
+                    path,
+                ));
+                let journal =
+                    self.watch_journal(info.clone(), |callback| watch.observe_events(callback));
                 let task = tokio::spawn(run_fs_watch(
                     subscription_id,
                     watch,
@@ -24801,6 +24978,7 @@ impl Session {
                     Arc::clone(&control),
                     self.out.clone(),
                     self.cancellation.clone(),
+                    journal,
                 ));
                 self.watchers.insert(
                     subscription_id,
@@ -24810,6 +24988,7 @@ impl Session {
                         task,
                         terminal_updates: None,
                         kv: None,
+                        diagnostics: Some(info),
                     },
                 );
                 self.fs
@@ -31595,6 +31774,7 @@ async fn send_git_snapshot(
     control: &FlowControl,
     out: &FrameSender,
     cancellation: &ConnectionCancellation,
+    journal: Option<&super::watch_diagnostics::WatchJournal>,
 ) -> Result<(), ()> {
     send_git_state_event(
         subscription_id,
@@ -31610,12 +31790,16 @@ async fn send_git_snapshot(
     )
     .await?;
     for record in records {
+        let record = git_state_record(record, RecordKind::Add)?;
+        if let Some(journal) = journal {
+            journal.records(revision, std::slice::from_ref(&record));
+        }
         send_git_state_event(
             subscription_id,
             Phase::SnapshotRecords,
             revision,
             revision,
-            vec![git_state_record(record, RecordKind::Add)?],
+            vec![record],
             event_limit,
             sent_bytes,
             control,
@@ -31792,6 +31976,7 @@ async fn run_git_query_watch(
     control: Arc<FlowControl>,
     out: FrameSender,
     cancellation: ConnectionCancellation,
+    journal: Option<super::watch_diagnostics::WatchJournal>,
 ) {
     let mut sent_bytes = 0u64;
     let mut revision = 1u64;
@@ -31804,6 +31989,7 @@ async fn run_git_query_watch(
         let Some(update) = update else {
             return;
         };
+        let before = sent_bytes;
         let kind = if snapshot {
             RecordKind::Add
         } else {
@@ -31823,6 +32009,9 @@ async fn run_git_query_watch(
             ) else {
                 return;
             };
+            if let Some(journal) = &journal {
+                journal.records(revision, std::slice::from_ref(&record));
+            }
             if send_git_query_state_event(
                 subscription_id,
                 Phase::SnapshotBegin,
@@ -31881,6 +32070,9 @@ async fn run_git_query_watch(
             ) else {
                 return;
             };
+            if let Some(journal) = &journal {
+                journal.records(next, std::slice::from_ref(&record));
+            }
             if send_git_query_state_event(
                 subscription_id,
                 Phase::Delta,
@@ -31900,10 +32092,14 @@ async fn run_git_query_watch(
             }
             revision = next;
         }
+        if let Some(journal) = &journal {
+            journal.state(revision, 1, sent_bytes - before);
+        }
         watch.acknowledge(update.update_id);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_git_watch(
     subscription_id: u32,
     mut revision: u64,
@@ -31912,6 +32108,7 @@ async fn run_git_watch(
     control: Arc<FlowControl>,
     out: FrameSender,
     cancellation: ConnectionCancellation,
+    journal: Option<super::watch_diagnostics::WatchJournal>,
 ) {
     let mut sent_bytes = 0u64;
     if send_git_snapshot(
@@ -31923,11 +32120,15 @@ async fn run_git_watch(
         &control,
         &out,
         &cancellation,
+        journal.as_ref(),
     )
     .await
     .is_err()
     {
         return;
+    }
+    if let Some(journal) = &journal {
+        journal.state(revision, 0, sent_bytes);
     }
     loop {
         let event = tokio::select! {
@@ -31953,6 +32154,8 @@ async fn run_git_watch(
             }
             Ok(super::yas_git_adapter::WatchEvent::Snapshot { state_id, records }) => {
                 let next = revision.saturating_add(1).max(1);
+                let before = sent_bytes;
+                let count = records.len();
                 if send_git_state_event(
                     subscription_id,
                     Phase::Reset,
@@ -31979,6 +32182,7 @@ async fn run_git_watch(
                     &control,
                     &out,
                     &cancellation,
+                    journal.as_ref(),
                 )
                 .await
                 .is_err()
@@ -31986,6 +32190,9 @@ async fn run_git_watch(
                     return;
                 }
                 revision = next;
+                if let Some(journal) = &journal {
+                    journal.state(revision, count, sent_bytes - before);
+                }
                 watch.acknowledge(state_id);
             }
         }
@@ -32145,6 +32352,7 @@ async fn run_fs_watch(
     control: Arc<FlowControl>,
     out: FrameSender,
     cancellation: ConnectionCancellation,
+    journal: Option<super::watch_diagnostics::WatchJournal>,
 ) {
     let mut sent_bytes = 0u64;
     let mut revision = 1u64;
@@ -32224,6 +32432,10 @@ async fn run_fs_watch(
         }
         if snapshot {
             for record in records {
+                let before = sent_bytes;
+                if let Some(journal) = &journal {
+                    journal.records(revision, std::slice::from_ref(&record));
+                }
                 if send_fs_state_event(
                     subscription_id,
                     Phase::SnapshotRecords,
@@ -32241,9 +32453,13 @@ async fn run_fs_watch(
                 {
                     return;
                 }
+                if let Some(journal) = &journal {
+                    journal.state(revision, 1, sent_bytes - before);
+                }
             }
         } else if records.is_empty() {
             let next = revision.saturating_add(1).max(1);
+            let before = sent_bytes;
             if send_fs_state_event(
                 subscription_id,
                 Phase::Delta,
@@ -32262,6 +32478,9 @@ async fn run_fs_watch(
                 return;
             }
             revision = next;
+            if let Some(journal) = &journal {
+                journal.state(revision, 0, sent_bytes - before);
+            }
         } else {
             // A delta transition is complete in one STATE frame. If the
             // filesystem watcher produced several records, advance the
@@ -32270,6 +32489,10 @@ async fn run_fs_watch(
             // a client after it applied the first record.
             for record in records {
                 let next = revision.saturating_add(1).max(1);
+                let before = sent_bytes;
+                if let Some(journal) = &journal {
+                    journal.records(next, std::slice::from_ref(&record));
+                }
                 if send_fs_state_event(
                     subscription_id,
                     Phase::Delta,
@@ -32288,6 +32511,9 @@ async fn run_fs_watch(
                     return;
                 }
                 revision = next;
+                if let Some(journal) = &journal {
+                    journal.state(revision, 1, sent_bytes - before);
+                }
             }
         }
         if update.snapshot_end && snapshot {
@@ -38973,6 +39199,7 @@ mod tests {
                 }],
             ),
             auxiliary_details: yas_client::AuxiliarySubscriptionDetails::default(),
+            auxiliary_timings: yas_client::AuxiliarySubscriptionTimings::default(),
         };
         let shared = NativeYasSubscriptions::default();
         assert!(shared.replace(snapshot.clone()));

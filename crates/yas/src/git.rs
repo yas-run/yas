@@ -2807,8 +2807,30 @@ pub struct WatchQuery {
     pub state: StateWatch,
 }
 
+impl WatchQuery {
+    /// WATCH_QUERY accepts the same settle-delay extensions as WATCH. Ref
+    /// prefixes and status classes are intrinsic to the query, not overrides.
+    pub fn options(&self) -> Result<WatchOptions> {
+        let supported = [
+            crate::schema::git::WATCH_REFS_SETTLE_MS_EXTENSION as u16,
+            crate::schema::git::WATCH_STATUS_SETTLE_MS_EXTENSION as u16,
+        ];
+        reject_unknown_required(&self.state.extensions, &supported)?;
+        WatchOptions::from_extensions(&Extensions(
+            self.state
+                .extensions
+                .0
+                .iter()
+                .filter(|extension| supported.contains(&extension.tag))
+                .cloned()
+                .collect(),
+        ))
+    }
+}
+
 impl Encode for WatchQuery {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.options()?;
         handle(self.repository_handle, "zero Git repository handle")?;
         if usize::from(self.max_records) > MAX_QUERY_RECORDS {
             return Err(limit(
@@ -4230,6 +4252,44 @@ mod tests {
             canonical_git_dir: b"/repo/.git".to_vec(),
             extensions: Extensions::default(),
         });
+    }
+
+    #[test]
+    fn watched_queries_accept_settle_delays_and_reject_malformed_extensions() {
+        let options = WatchOptions {
+            refs_settle_ms: 17,
+            status_settle_ms: 23,
+            ..Default::default()
+        };
+        let mut request = WatchQuery {
+            repository_handle: 1,
+            max_records: 10,
+            body: QueryBody::Resolve {
+                spec: b"HEAD".to_vec(),
+            },
+            state: StateWatch {
+                initial_credit: 4096,
+                resume: None,
+                extensions: options.to_extensions().unwrap(),
+            },
+        };
+        assert_eq!(
+            WatchQuery::decode(&request.encode().unwrap())
+                .unwrap()
+                .options()
+                .unwrap(),
+            options
+        );
+        request.state.extensions.0[0].value.push(0);
+        assert!(request.encode().is_err());
+        request.state.extensions = Extensions(vec![Extension {
+            tag: 99,
+            required: true,
+            value: vec![],
+        }]);
+        assert!(request.encode().is_err());
+        request.state.extensions.0[0].required = false;
+        assert_eq!(request.options().unwrap(), WatchOptions::default());
     }
 
     #[test]

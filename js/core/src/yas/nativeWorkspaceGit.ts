@@ -593,7 +593,11 @@ class NativeGitRepository implements YasNativeGitRepoHandle {
     const subscription = new NativeGitLogSubscription(
       this,
       spec,
-      options,
+      {
+        refsLatencyMs: this.options.refsLatencyMs,
+        statusLatencyMs: this.options.statusLatencyMs,
+        ...options,
+      },
       onUpdate,
     );
     this.watchedLogs.add(subscription);
@@ -710,6 +714,8 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
         {
           initialCredit: queryCredit(this.options.limit ?? 0),
           maxRecords: this.options.limit ?? 0,
+          refsSettleMs: this.options.refsLatencyMs,
+          statusSettleMs: this.options.statusLatencyMs,
         },
       )
       .then((native) => {

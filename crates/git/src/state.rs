@@ -170,6 +170,7 @@ fn engines() -> &'static EngineRegistry {
 struct EngineRef {
     tx: SyncSender<EngineMsg>,
     key: Arc<PathBuf>,
+    observers: yas_fssync::backend::EventObservers,
 }
 
 impl Drop for EngineRef {
@@ -238,6 +239,13 @@ pub struct StateHandle {
 }
 
 impl StateHandle {
+    pub fn observe_events(
+        &self,
+        callback: Box<yas_fssync::backend::EventCallback>,
+    ) -> yas_fssync::backend::EventObserver {
+        self.engine.observers.observe(callback)
+    }
+
     pub fn ack(&self, state_id: u32) {
         let _ = self.engine.tx.send(EngineMsg::Ack {
             sub_id: self.sub_id,
@@ -286,6 +294,7 @@ impl RepoHandle {
         let engine = Arc::new(EngineRef {
             tx,
             key: self.gitdir.clone(),
+            observers: Default::default(),
         });
         reg.insert((*self.gitdir).clone(), Arc::downgrade(&engine));
         drop(reg);
@@ -293,11 +302,12 @@ impl RepoHandle {
         // sees is this subscriber.
         let _ = engine.tx.send(attach);
         let watch_tx = engine.tx.clone();
+        let observers = engine.observers.clone();
         let handle = self.clone();
         let seq = NEXT_ENGINE.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
             .name(format!("yas-git-state-{seq}"))
-            .spawn(move || Engine::new(handle).run(rx, watch_tx))
+            .spawn(move || Engine::new(handle).run(rx, watch_tx, observers))
             .expect("spawn git state engine");
         StateHandle { engine, sub_id }
     }
@@ -552,7 +562,12 @@ impl Engine {
         }
     }
 
-    fn run(mut self, rx: Receiver<EngineMsg>, watch_tx: SyncSender<EngineMsg>) {
+    fn run(
+        mut self,
+        rx: Receiver<EngineMsg>,
+        watch_tx: SyncSender<EngineMsg>,
+        observers: yas_fssync::backend::EventObservers,
+    ) {
         // Serve the attaches queued before this thread started, so the
         // watch set is armed against real subscriber demand in one pass
         // (see `sync_watches`) rather than armed broadly and narrowed.
@@ -563,7 +578,7 @@ impl Engine {
                 return;
             }
         }
-        if let Err(reason) = self.arm_watcher(watch_tx) {
+        if let Err(reason) = self.arm_watcher(watch_tx, observers) {
             // Watching can never work — state would silently go stale, so
             // every subscriber (present and future) is closed with the
             // reason. The thread stays to answer attaches until the last
@@ -730,13 +745,18 @@ impl Engine {
 
     /// Create the watcher and arm the initial set. `Err(reason)` when the
     /// watcher itself cannot exist.
-    fn arm_watcher(&mut self, tx: SyncSender<EngineMsg>) -> Result<(), u8> {
+    fn arm_watcher(
+        &mut self,
+        tx: SyncSender<EngineMsg>,
+        observers: yas_fssync::backend::EventObservers,
+    ) -> Result<(), u8> {
         // The dominant gitdir churn (fetch/gc/commit/hash-object) writes
         // under objects/; those events carry no HEAD/ref/status meaning,
         // so drop them before they reach the engine thread.
         let objects = [self.gitdir.join("objects"), self.common.join("objects")];
         let overflow = self.watch_overflow.clone();
         let watcher = yas_fssync::backend::watcher(move |res: notify::Result<notify::Event>| {
+            observers.emit(&res);
             // Backend-reported loss (IN_Q_OVERFLOW) and notify errors take
             // the same coalesced path as a full queue.
             let event = match res {
