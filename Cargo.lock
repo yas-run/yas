@@ -8338,6 +8338,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-server",
+ "yas-runtime-dir",
 ]
 
 [[package]]
@@ -8458,6 +8459,14 @@ dependencies = [
  "yas-webrtc-forwarder",
  "yas-webserver",
  "yas-wire",
+]
+
+[[package]]
+name = "yas-runtime-dir"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -8613,6 +8622,7 @@ dependencies = [
  "notify",
  "tempfile",
  "tokio",
+ "yas-runtime-dir",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ members = [
     "crates/webrtc-forwarder",
     "crates/compositor",
     "crates/proxy",
+    "crates/runtime-dir",
     "crates/sd-notify",
     "crates/ssh",
     "crates/desktop",
@@ -58,6 +59,7 @@ yas-edge = { version = "0.2.6", path = "crates/edge" }
 yas-proxy = { version = "0.2.6", path = "crates/proxy" }
 yas-webrtc-forwarder = { version = "0.2.6", path = "crates/webrtc-forwarder" }
 yas-compositor = { version = "0.2.6", path = "crates/compositor" }
+yas-runtime-dir = { version = "0.2.6", path = "crates/runtime-dir" }
 yas-sd-notify = { version = "0.2.6", path = "crates/sd-notify" }
 yas-ssh = { version = "0.2.6", path = "crates/ssh" }
 yas-desktop = { version = "0.2.6", path = "crates/desktop" }
