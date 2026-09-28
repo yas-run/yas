@@ -1564,6 +1564,9 @@ future REPLAY operations. REPLACE does not merge with the old command, cwd,
 environment, deadline, or application association. It can therefore restart a
 terminal with any argv or shell command, any valid cwd, and any environment the
 server OS can represent. REPLAY has no launch bytes; REPLACE requires them.
+The stored launch record belongs to the terminal, not to the connection that
+created it, so any client that can see the terminal can REPLAY it. A terminal
+that was never started from a launch record answers REPLAY with `UNSUPPORTED`.
 
 RESTART is valid for RUNNING and EXITED terminals. For an EXITED terminal both
 cutover modes simply start the new generation. For a RUNNING terminal the
@@ -2010,13 +2013,18 @@ index; with it, `from_index` is the number of records skipped back from
 and PROBE 3. COMMAND uses `a=command_index,b=column`, LATEST_COMMAND requires
 `a=0`, and SEQUENCE/PROBE use `a=sequence,b=column`; OUTPUT flags are zero.
 Every OUTPUT next cursor is normalized to SEQUENCE with `a=next_seq` and
-`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results.
+`b=next_col`, including COMMAND, LATEST_COMMAND, and PROBE results. A SEQUENCE
+cursor past the end of the output returns empty text whose start and next
+cursor are both the current end.
 
 WAIT kinds are OUTPUT 0, COMMAND 1, and LATEST_COMMAND 2, with zero flags.
 OUTPUT uses `a=sequence,b=column`, requires a nonempty needle, and returns an
 OutputResult. COMMAND uses `a=command_index,b=0` and an empty needle;
-LATEST_COMMAND requires `a=b=0` and an empty needle. Both command waits return
-a JournalResult containing exactly one command record. Timeouts and byte
+LATEST_COMMAND requires `a=b=0` and an empty needle; it selects the running
+command, or the next command to start when none is running. Both command waits
+return a JournalResult containing exactly one command record. A command wait
+whose timeout expires before its command exists fails with `TIMEOUT`; one whose
+terminal has exited without it fails with `NOT_FOUND`. Timeouts and byte
 limits are nonzero.
 
 COPY_RANGE rows are inclusive, oldest-retained-relative when nonnegative, and
@@ -2131,7 +2139,9 @@ present in a selected family descriptor and cannot exceed their canonical hard
 maximums.
 
 DISCONNECT names a session ID, operation ID, and UTF-8 reason. Its Result is
-queued before the target receives Core GOAWAY. Targeting the caller is valid
+queued before the target receives Core GOAWAY. A nonempty reason travels in
+that GOAWAY's detail as optional Core extension `GOAWAY_REASON_EXTENSION` (1),
+whose value is the reason's UTF-8 bytes. Targeting the caller is valid
 and becomes an orderly self-disconnect after the Result is sent. Core SHUTDOWN,
 not this family, stops the whole server.
 
