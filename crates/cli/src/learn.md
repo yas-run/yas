@@ -59,6 +59,8 @@ yas terminal send "$ID" "\x03"     # Ctrl+C
 ```
 
 Supports C-style escapes: `\n`, `\t`, `\r`, `\\`, `\0`, `\xHH`. Use `-` to read from stdin.
+Sending to an exited terminal fails with a nonzero exit instead of dropping the
+input.
 
 `\n` sends CR (0x0D), which is what a real terminal sends for Enter. This works
 regardless of whether the program is in canonical or raw mode. `\r` also sends
@@ -142,6 +144,8 @@ yas terminal journal "$ID" --json
 ```
 
 `--wait` blocks server-side until the command finishes (exit 124 on timeout).
+Without an index it waits for the running command, or the next one to start if
+none is running, so a finished command is never mistaken for the one just sent.
 `wait --pattern` matches only output produced after the wait began.
 
 ## Terminal lifecycle
@@ -157,6 +161,9 @@ yas terminal resize "$ID" 200 50  # set the viewport (cols rows)
 yas terminal attach "$ID"    # drive it from here; Ctrl-] detaches
 yas quit                     # shut down the server
 ```
+
+A disconnected CLI exits with `yas: disconnected by the YAS server: REASON`
+when the disconnecting client gave a reason.
 
 Terminals persist until closed or the daemon exits. Clean up when done.
 
@@ -226,6 +233,14 @@ yas remote add prod ssh:alice@prod.co
 yas remote set-default prod
 ```
 
+A bare name (from `--on`, `YAS_TARGET`, or `yas.target` in `yas.conf`) is
+looked up in the home server's remotes catalogue, the one `yas remote add`
+edits: the server at `YAS_SOCK`, else the default local instance, started if
+needed. A name may point at another name. Disabled remotes
+(`yas remote toggle`) and unknown names fail with an error. `yas remote`
+verbs edit the home server too unless `--on` names another server; the
+default target does not redirect them.
+
 ## Files
 
 All paths are relative to `--root` (default: the client's cwd, resolved
@@ -263,7 +278,8 @@ yas fs ln -s target link   # symlink (omit -s for a hard link)
 ## Git
 
 Read-only introspection of repositories on the server. `--repo` picks the
-worktree (default: cwd); `--json` emits NDJSON.
+worktree; a relative path, and the default `.`, resolve against the client's
+cwd, as `--root` does for `fs` and `lsp`. `--json` emits NDJSON.
 
 ```bash
 yas git status                     # branch, ahead/behind, stash, worktree
@@ -272,7 +288,7 @@ yas git log                        # history, newest first
 yas git log v1.0                   # from a tag
 yas git log main..feature          # a range
 yas git log --follow -- src/main.rs
-yas git diff                       # unstaged
+yas git diff                       # unstaged (-p for hunks)
 yas git diff --staged              # staged
 yas git diff main dev              # between two commits
 yas git diff main...dev            # since they diverged (from the merge base)
@@ -280,6 +296,7 @@ yas git diff --merge-base main     # worktree vs where main forked (a `base` lin
 yas git diff HEAD~2 -p -- src      # with hunks, limited to a path
 yas git show HEAD:src/main.rs      # a file's bytes at a revision
 yas git show HEAD                  # the commit object itself
+yas git show HEAD:src              # a directory, listed like ls-tree
 yas git ls-tree HEAD                # one tree level (MODE TYPE OID<TAB>NAME)
 yas git ls-tree HEAD:src            # descend by passing a path
 yas git merge-base main feature     # best common ancestors (exit 1 if unrelated)
@@ -365,6 +382,14 @@ Everything after the module path belongs to the extension, hyphens included,
 so `run`/`update` options go before the name. `--restart`, `--persist`,
 `--detach` and `--json` written after the module are refused rather than
 handed over; put a `--` first if the extension really wants one of them.
+
+An attached `run` prints the attempt's stdout, stderr, and log output, even
+when it finishes before the CLI starts following, and exits with the
+extension's return code. A trapped or failed attempt prints
+`yas: extension NAME trapped: DETAIL` to stderr and exits 1. A detached
+transient extension keeps its name for 30 s after it stops
+(`YAS_EXT_TERMINAL_RETAIN`) so its output can be replayed; `run` refuses to
+reuse that name until then and says so.
 
 `yas ext manage` opens an inline extension picker. Move with arrows or `j`/`k`
 and use Space or a mouse click to cycle the selected action: install for new
@@ -491,12 +516,17 @@ and `YAS_NET=0` govern it. The proxy ends with the process.
 
 ```bash
 yas clipboard list                            # list available MIME types
-yas clipboard get                             # read clipboard (text/plain)
+yas clipboard get                             # read clipboard as plain text
 yas clipboard get --mime image/png > shot.png # read specific MIME type
 yas clipboard set "hello"                     # set clipboard from argument
 echo "hello" | yas clipboard set              # set clipboard from stdin
 yas clipboard set --mime image/png < shot.png # set specific MIME type
 ```
+
+`set` offers text as `text/plain;charset=utf-8`. A plain-text `get`
+(`text/plain`, with or without a charset, or `UTF8_STRING`) reads whichever
+plain-text variant the owner offered, so set-then-get round-trips; other MIME
+types must match a listed type exactly.
 
 ## GUI surfaces
 
@@ -530,4 +560,11 @@ yas surface focus 1                                # give it keyboard/pointer fo
 yas surface record 1 --output video.h264           # record until Ctrl+C
 yas surface record 1 --duration 10 --output v.h264 # record 10 seconds
 yas surface record 1 --frames 30 --output v.h264   # record 30 frames
+yas surface record 1 --codec h264-444              # also announce H.264 4:4:4
 ```
+
+`record` without `--output` writes `surface-ID.h264`, or `surface-ID.obu` when
+the server picks AV1. `--codec h264-444`/`av1-444` announce 4:4:4 chroma; the
+server still falls back to 4:2:0 unless its `YAS_CHROMA` setting and encoder
+allow 4:4:4. `capture --scale` resizes the surface at that scale before
+capturing; there is no image quality setting.

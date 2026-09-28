@@ -529,7 +529,6 @@ async fn async_main() {
                     id,
                     output,
                     format,
-                    quality,
                     width,
                     height,
                     scale,
@@ -540,7 +539,6 @@ async fn async_main() {
                         id,
                         output,
                         format,
-                        quality,
                         width,
                         height,
                         scale,
@@ -1010,8 +1008,14 @@ async fn async_main() {
             }
         }
         Command::Open { port } => {
-            let hub = yas_webrtc_forwarder::normalize_hub(&cli.connect.hub);
-            interactive::run_browser(port, &hub).await;
+            let hub_env = std::env::var_os("YAS_HUB").is_some();
+            if let Err(error) =
+                open_target_flags(cli.connect.on.as_deref(), &cli.connect.hub, hub_env)
+            {
+                eprintln!("yas: {error}");
+                std::process::exit(2);
+            }
+            interactive::run_browser(port).await;
         }
         Command::Edge => {
             yas_edge::run().await;
@@ -1091,6 +1095,22 @@ async fn async_main() {
 
 /// Read a `usize` limit from the environment. Unset, unparseable or 0 all
 /// mean "no limit", which is what the server's `> 0` guards already expect.
+/// `yas open` always serves the local server's UI and reaches other targets
+/// through its Remotes dialog, so a command-line target would be ignored.
+fn open_target_flags(on: Option<&str>, hub: &str, hub_env: bool) -> Result<(), String> {
+    if let Some(on) = on {
+        let on = mask_remote_credentials(on);
+        return Err(format!(
+            "yas open does not take --on ({on}); it opens the local server's UI, which \
+             lists configured remotes (add one with `yas remote add NAME {on}`)"
+        ));
+    }
+    if !hub_env && hub != yas_webrtc_forwarder::DEFAULT_HUB_URL {
+        return Err("yas open does not take --hub; it opens the local server's UI".into());
+    }
+    Ok(())
+}
+
 fn env_usize(key: &str) -> usize {
     std::env::var(key)
         .ok()
@@ -1226,7 +1246,13 @@ fn mask_remote_credentials(uri: &str) -> String {
 /// catalogue is (`crates/cli/src/yas_remotes.rs`). `set-default` stays local:
 /// which server *this* CLI talks to by default is this machine's business, not
 /// something a server should hold an opinion about.
+///
+/// Without `--on` the verbs edit the home server, not `YAS_TARGET` or
+/// `yas.target`: names resolve against the home catalogue, so after
+/// `set-default work` a `toggle work` must still reach the catalogue that
+/// defines `work`.
 async fn cmd_remote(cmd: RemoteCommand, on: Option<&str>, hub: &str) -> Result<(), String> {
+    let on = Some(on.unwrap_or("local"));
     match cmd {
         RemoteCommand::List { reveal } => {
             let entries = yas_remotes::read(on, hub).await?;
@@ -1463,7 +1489,18 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_remote_credentials, proxy_daemon_requested};
+    use super::{mask_remote_credentials, open_target_flags, proxy_daemon_requested};
+
+    #[test]
+    fn open_refuses_targets_it_would_ignore() {
+        let default_hub = yas_webrtc_forwarder::DEFAULT_HUB_URL;
+        assert!(open_target_flags(None, default_hub, false).is_ok());
+        let error = open_target_flags(Some("share:secret"), default_hub, false).unwrap_err();
+        assert!(error.contains("--on"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(open_target_flags(None, "hub.example", false).is_err());
+        assert!(open_target_flags(None, "hub.example", true).is_ok());
+    }
 
     #[test]
     fn test_mask_remote_credentials() {

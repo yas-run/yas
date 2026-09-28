@@ -292,7 +292,12 @@ You can also run a `@yas-run/core` client **server-side** (Node/Bun/Deno) to dri
 local `yas server` over its unix-domain socket — e.g. to script terminals or run
 headless commands. The non-browser building blocks live under the
 `@yas-run/core/node` subpath (kept out of the package root so `node:net` and
-runtime globals never leak into browser bundles):
+runtime globals never leak into browser bundles). The packages are plain ES
+modules; install `@yas-run/core` with its matching `@yas-run/browser` peer:
+
+```bash
+npm install @yas-run/core @yas-run/browser
+```
 
 ```ts
 import { YasWorkspace, exitCodeFromStatus, nullLogger } from "@yas-run/core";
@@ -315,6 +320,17 @@ const workspace = new YasWorkspace({
   connections: [{ id: "default", transport }],
 });
 
+// Families are negotiated after the HELLO round trip; wait before creating.
+await new Promise<void>((resolve) => {
+  const check = () => {
+    if (!workspace.getSnapshot().ready) return;
+    unsubscribe();
+    resolve();
+  };
+  const unsubscribe = workspace.subscribe(check);
+  check();
+});
+
 const session = await workspace.createSession({
   connectionId: "default",
   rows: 24,
@@ -323,10 +339,11 @@ const session = await workspace.createSession({
 });
 ```
 
-The unix transport speaks yas's framing protocol (4-byte little-endian
-length-prefixed frames) for you — there is no need to re-implement the wire
-format. `BunUnixSocketTransport` and `DenoUnixSocketTransport` are the
-runtime-native equivalents.
+The unix transport carries the YAS byte stream (the preface, then 4-byte
+little-endian length-prefixed frames) for you; there is no need to
+re-implement the wire format. `BunUnixSocketTransport` and
+`DenoUnixSocketTransport` are the runtime-native equivalents; Deno needs
+`--allow-read --allow-write` for the socket path.
 
 ### Exit status
 
