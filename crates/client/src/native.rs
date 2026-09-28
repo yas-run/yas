@@ -30,7 +30,7 @@ use yas_wire::{
     },
 };
 
-use crate::error::{Error, Result, format_result_detail, wire_error};
+use crate::error::{Error, Result, wire_error};
 use crate::transport;
 use crate::{ConnectOptions, HelloOptions};
 
@@ -1004,10 +1004,7 @@ impl NativeClient {
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(Error::GoAway {
-                    status: goaway.status,
-                    detail: format_result_detail(&goaway.detail),
-                });
+                return Err(Error::goaway(&goaway));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
@@ -1215,10 +1212,7 @@ impl NativeFrameReader {
                 && frame.header.kind == yas_wire::core::event_kind::GOAWAY
             {
                 let goaway = GoAway::decode(&frame.payload).map_err(wire_error)?;
-                return Err(Error::GoAway {
-                    status: goaway.status,
-                    detail: format_result_detail(&goaway.detail),
-                });
+                return Err(Error::goaway(&goaway));
             }
             if frame.header.class == Class::Event
                 && frame.header.family == family::CORE
