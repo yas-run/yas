@@ -66,7 +66,8 @@ pub struct Cli {
 #[derive(Args, Clone)]
 pub struct ConnectOpts {
     /// Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local[:name])
-    /// or a named remote from yas.remotes. Overrides YAS_TARGET and yas.conf `target`.
+    /// or the name of a remote on the home server (see `yas remote`). Overrides
+    /// YAS_TARGET and yas.conf `yas.target`.
     #[arg(long, global = true)]
     pub on: Option<String>,
 
@@ -397,11 +398,16 @@ pub enum Command {
     /// Execute a process and connect its standard streams
     Run(RunArgs),
 
-    /// Manage named remotes in yas.remotes
+    /// Manage the server's named remotes
     ///
     /// Named remotes let you refer to frequently-used destinations by a short
-    /// name instead of a full URI.  They are stored in ~/.config/yas/yas.remotes
-    /// (mode 0o600) and can also be set as the default target via `yas.conf`.
+    /// name instead of a full URI. They are stored in a server's KV store (the
+    /// `remotes` key), which is also the catalogue its Relay publishes to the
+    /// browser. These verbs edit the home server (YAS_SOCK, else the default
+    /// local instance) unless --on names another; YAS_TARGET and `yas.target`
+    /// do not redirect them. `--on NAME`, YAS_TARGET, and `yas.target` look
+    /// names up on the home server. A legacy ~/.config/yas/yas.remotes file is
+    /// imported once into a server that has no catalogue yet.
     ///
     /// Examples:
     ///   yas remote add rabbit ssh:rabbit
@@ -421,9 +427,10 @@ pub enum Command {
     #[command(
         about = "Open the terminal UI in the browser",
         long_about = "Open the terminal UI in the browser\n\n\
-            Opens the browser with all named remotes from ~/.config/yas/yas.remotes\n\
-            plus the local yas server. Manage remotes with `yas remote add/remove`\n\
-            or through the Remotes dialog in the browser.\n\n\
+            Opens the browser on the local yas server, with that server's named\n\
+            remotes reachable through its Relay. Manage remotes with\n\
+            `yas remote add/remove` or through the Remotes dialog in the browser.\n\
+            `--on` and `--hub` are refused: the UI always starts from the local server.\n\n\
             Examples:\n\
               yas open                        # local + all configured remotes\n\
               yas remote add rabbit ssh:rabbit\n\
@@ -594,7 +601,8 @@ pub enum Command {
         fd_channel: Option<i32>,
 
         /// Export the server socket path as YAS_SOCK in spawned terminals
-        /// (or set YAS_EXPORT_SOCK=1)
+        /// (or set YAS_EXPORT_SOCK=1). Without it, terminals still never
+        /// inherit a YAS_SOCK that names a different server
         #[arg(long)]
         export_sock: bool,
 
@@ -1019,9 +1027,11 @@ pub enum TerminalCommand {
 
     /// Print one command's output (needs OSC 133 shell integration).
     ///
-    /// Defaults to the newest command. With --wait, blocks server-side until
-    /// the command finishes and exits with its status (124 if the wait timed
-    /// out), which is how to run something in a live shell and collect the
+    /// Defaults to the newest command. With --wait and no INDEX, it picks the
+    /// command that is running, or if none is, the next one to start (so a
+    /// command sent just before still counts), blocks server-side until that
+    /// command finishes, and exits with its status (124 if the wait timed
+    /// out). This is how to run something in a live shell and collect the
     /// result:
     ///   yas terminal send 3 'cargo test\n'
     ///   yas terminal output 3 --wait 600
@@ -1277,6 +1287,7 @@ pub enum TerminalCommand {
 
     /// Send input to a terminal.
     ///
+    /// Fails if the terminal has exited.
     /// Supports C-style escapes: \n \r \t \\ \0 \xHH.
     /// \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF.
     /// To control interactive programs like vim:
@@ -1553,10 +1564,6 @@ pub enum SurfaceCommand {
         #[arg(short, long)]
         format: Option<String>,
 
-        /// Quality: 0 = lossless, 1-100 = lossy (applies to AVIF only)
-        #[arg(short, long, default_value_t = 0)]
-        quality: u8,
-
         /// Resize the surface to this width (pixels) before capturing
         #[arg(long)]
         width: Option<u16>,
@@ -1566,8 +1573,9 @@ pub enum SurfaceCommand {
         height: Option<u16>,
 
         /// Render scale in 120ths (wp_fractional_scale_v1 units).
-        /// 120 = 1x, 240 = 2x, 180 = 1.5x, etc.
-        /// Default (0) uses the compositor's current output scale.
+        /// 120 = 1x, 240 = 2x, 180 = 1.5x, etc. Resizes the surface to its
+        /// current (or --width/--height) logical size at this scale before
+        /// capturing. Default (0) leaves the surface's scale alone.
         #[arg(long, default_value_t = 0)]
         scale: u16,
     },
@@ -1606,7 +1614,8 @@ pub enum SurfaceCommand {
         /// Surface ID
         id: u64,
 
-        /// Wheel detents; positive = down/right
+        /// Wheel detents; positive = down/right, negative = up/left
+        #[arg(allow_negative_numbers = true)]
         amount: f64,
 
         /// Scroll horizontally instead of vertically
@@ -1661,7 +1670,8 @@ pub enum SurfaceCommand {
         /// Surface ID
         id: u64,
 
-        /// Output file path (default: surface-<id>.<codec>)
+        /// Output file path (default: surface-<id>.h264, or surface-<id>.obu
+        /// for AV1)
         #[arg(short, long)]
         output: Option<String>,
 
@@ -1674,10 +1684,11 @@ pub enum SurfaceCommand {
         duration: f64,
 
         /// Codec(s) to announce as supported (comma-separated or repeated).
-        /// Accepted values: h264, av1, h264-444, av1-444 — the `-444`
-        /// variants also announce 4:4:4 chroma, which is what makes the
-        /// server pick a 4:4:4 encoder.
-        /// Default: all codecs.
+        /// Accepted values: h264, av1, h264-444, av1-444. The `-444`
+        /// variants also announce 4:4:4 chroma for that codec; the server
+        /// encodes 4:4:4 only when its own chroma setting and encoder allow
+        /// it, and falls back to 4:2:0 otherwise.
+        /// Default: h264 and av1 at 4:2:0.
         #[arg(short, long, value_delimiter = ',')]
         codec: Vec<String>,
 
@@ -1804,7 +1815,7 @@ pub enum FsCommand {
     /// --json, emits one NDJSON event per record (`upsert`, `delete`,
     /// `move`, plus `reset`/`sync` staging markers and `synced`/`closed`).
     Sync {
-        /// Path on the server (absolute, or relative to the server's cwd)
+        /// Path on the server (absolute, or relative to the client's cwd)
         path: String,
 
         /// Sync file contents too (hashes always sync)
@@ -2012,12 +2023,13 @@ pub enum FsCommand {
         #[arg(short = 'w', long)]
         word: bool,
 
-        /// Search gitignored files too; they rank after tracked ones.
-        /// Much slower on a tree with build output.
+        /// Search gitignored files and `.git` too. Results stay in path
+        /// order; ignored files are marked in --json. Much slower on a tree
+        /// with build output.
         #[arg(long)]
         no_ignore: bool,
 
-        /// Stop after this many matching files (0 = server default)
+        /// Stop after this many matching files (0 = no limit)
         #[arg(short = 'm', long, default_value_t = 0)]
         max_matches: u16,
 
@@ -2068,7 +2080,7 @@ pub enum FsCommand {
 pub enum GitCommand {
     /// Branch, ahead/behind, stash, and working-tree status
     Status {
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2098,7 +2110,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2154,7 +2166,7 @@ pub enum GitCommand {
         #[arg(last = true)]
         pathspec: Vec<String>,
 
-        /// Repository location on the server (default: server cwd)
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2188,12 +2200,15 @@ pub enum GitCommand {
     ///   yas git show HEAD:src/main.rs   # a file at a revision
     ///   yas git show v1.0:Cargo.toml
     ///   yas git show HEAD               # the commit object itself
+    ///   yas git show HEAD:src           # a directory, listed like ls-tree
     Show {
-        /// REV[:PATH]. Omit PATH for the commit object; omit REV
-        /// (`:path`) for HEAD.
+        /// REV[:PATH]. REV names a commit; reach trees and blobs by PATH.
+        /// Omit PATH for the commit object (in `git cat-file commit`
+        /// layout); a directory PATH is listed like ls-tree, and `REV:`
+        /// lists the root tree. Omit REV (`:path`) for HEAD.
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2210,7 +2225,7 @@ pub enum GitCommand {
         /// REV[:PATH]; omit PATH for the root tree
         spec: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2228,7 +2243,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2245,7 +2260,7 @@ pub enum GitCommand {
         #[arg(required = true, num_args = 2..)]
         revs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2263,7 +2278,7 @@ pub enum GitCommand {
         /// File to blame
         path: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2298,7 +2313,7 @@ pub enum GitCommand {
         #[arg(default_value = "")]
         ref_name: String,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2320,7 +2335,7 @@ pub enum GitCommand {
     /// TSV: WORKDIR<TAB>GITDIR. Deduped by gitdir, so several paths
     /// resolving to one repository report once.
     Discover {
-        /// Directory to search (default: server cwd)
+        /// Directory to search (relative to the client's cwd)
         #[arg(default_value = ".")]
         path: String,
 
@@ -2354,7 +2369,7 @@ pub enum GitCommand {
         /// Refspecs to fetch (default: the remote's configured ones)
         refspecs: Vec<String>,
 
-        /// Repository path on the server
+        /// Repository path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         repo: String,
 
@@ -2469,7 +2484,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2487,7 +2502,7 @@ pub enum LspCommand {
         #[arg(long)]
         declaration: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2501,7 +2516,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2518,7 +2533,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2535,7 +2550,7 @@ pub enum LspCommand {
         /// Position, 1-based (e.g. src/main.rs:10:4)
         spec: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2554,7 +2569,7 @@ pub enum LspCommand {
         #[arg(long)]
         file: Option<String>,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2575,11 +2590,12 @@ pub enum LspCommand {
         #[arg(long)]
         watch: bool,
 
-        /// Wait for language servers to finish indexing first
+        /// Wait for language servers to finish indexing, then for the next
+        /// published diagnostics (or 5 seconds without any server update)
         #[arg(long)]
         wait: bool,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2597,7 +2613,7 @@ pub enum LspCommand {
         /// The new name
         new_name: String,
 
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2608,7 +2624,7 @@ pub enum LspCommand {
 
     /// Block until the workspace's language servers are ready
     Wait {
-        /// Workspace location on the server (default: server cwd)
+        /// Workspace path on the server (relative to the client's cwd)
         #[arg(long, default_value = ".")]
         root: String,
 
@@ -2660,8 +2676,8 @@ pub enum RemoteCommand {
     },
 
     /// Disable or enable a named remote without removing it.
-    /// Disabled remotes are kept in yas.remotes (commented out) and excluded
-    /// from connection resolution until re-enabled.
+    /// Disabled remotes stay in the catalogue but are not published by the
+    /// Relay, and `--on NAME` refuses them until re-enabled.
     Toggle {
         /// Name of the remote to toggle
         name: String,
@@ -2669,8 +2685,9 @@ pub enum RemoteCommand {
 
     /// Set the default remote in yas.conf
     ///
-    /// After this, all agent subcommands (list, start, show, …) will connect
-    /// to this remote by default, without needing --on.
+    /// Writes `yas.target` in this machine's yas.conf. After this, commands
+    /// without --on connect to this remote. A name is looked up on the home
+    /// server at each connection.
     SetDefault {
         /// Name or URI to use as the default target.
         /// Pass an empty string or "local" to reset to local.
@@ -2701,6 +2718,25 @@ mod tests {
         };
         assert_eq!(args.from, "http://localhost:10003/ext");
         assert!(Cli::try_parse_from(["yas", "ext", "install"]).is_err());
+    }
+
+    #[test]
+    fn surface_scroll_accepts_a_negative_amount() {
+        let cli =
+            Cli::try_parse_from(["yas", "surface", "scroll", "1", "-2.5", "--horizontal"]).unwrap();
+        let Command::Surface {
+            command:
+                Some(SurfaceCommand::Scroll {
+                    id,
+                    amount,
+                    horizontal,
+                    ..
+                }),
+        } = cli.command
+        else {
+            panic!("scroll must parse as a surface scroll");
+        };
+        assert_eq!((id, amount, horizontal), (1, -2.5, true));
     }
 
     #[test]
