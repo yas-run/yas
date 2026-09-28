@@ -2052,7 +2052,7 @@ async fn serve_registered<S>(
         )
     });
     let native_active_subscriptions = Arc::new(NativeYasSubscriptions::default());
-    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel(1);
+    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel::<String>(1);
     let native_client_registered = registration.is_some() && services.app_state.is_some();
     #[cfg(target_os = "linux")]
     let mut native_backend_owner = None;
@@ -2610,10 +2610,10 @@ async fn serve_registered<S>(
                     None => break 'session "native Channel terminal event channel closed".to_owned(),
                 },
                 disconnect = native_disconnect_rx.recv(), if native_client_registered => {
-                    if disconnect.is_none() {
+                    let Some(reason) = disconnect else {
                         break 'session "native client disconnect channel closed".to_owned();
-                    }
-                    if session.send_client_goaway().await.is_err() {
+                    };
+                    if session.send_client_goaway(&reason).await.is_err() {
                         break 'session "native client disconnect requested; GOAWAY failed".to_owned();
                     }
                     break 'session "native client disconnect requested; GOAWAY sent".to_owned();
@@ -3849,9 +3849,6 @@ impl TerminalCatalogue {
 struct TerminalRuntime {
     catalogue: TerminalCatalogue,
     app_handles: HashMap<u64, u64>,
-    /// Exact native launch records. Terminals created outside this connection
-    /// predate its launch catalogue and intentionally have no replayable launch.
-    launches: HashMap<u64, yas_terminal::Launch>,
     operations: HashMap<[u8; 16], TerminalOperationReplay>,
     next_view_id: u32,
     views: HashMap<u32, TerminalView>,
@@ -4956,7 +4953,6 @@ impl TerminalRuntime {
         Self {
             catalogue,
             app_handles: HashMap::new(),
-            launches: HashMap::new(),
             operations: HashMap::new(),
             next_view_id: 1,
             views: HashMap::new(),
@@ -6066,6 +6062,7 @@ const fn terminal_query_status(error: &super::yas_terminal_queries::Error) -> St
         super::yas_terminal_queries::Error::NotFound => Status::NotFound,
         super::yas_terminal_queries::Error::Stale => Status::Stale,
         super::yas_terminal_queries::Error::TooLarge => Status::ResourceExhausted,
+        super::yas_terminal_queries::Error::Timeout => Status::Timeout,
         super::yas_terminal_queries::Error::Internal => Status::Internal,
     }
 }
@@ -7304,11 +7301,11 @@ impl Session {
         Ok(())
     }
 
-    async fn send_client_goaway(&self) -> Result<(), ()> {
+    async fn send_client_goaway(&self, reason: &str) -> Result<(), ()> {
         let payload = GoAway {
             status: Status::Ok,
             close_deadline_server_ns: monotonic_ns(),
-            detail: Extensions::default(),
+            detail: GoAway::reason_detail(reason),
         }
         .encode()
         .map_err(|_| ())?;
@@ -8678,7 +8675,7 @@ impl Session {
         self.send_sensitive_result_confirmed(&frame, status, Vec::new())
             .await?;
         if let Some(disconnect) = target {
-            let _ = disconnect.send(()).await;
+            let _ = disconnect.send(request.reason).await;
         }
         Ok(())
     }
@@ -12751,7 +12748,11 @@ impl Session {
         #[cfg(target_os = "linux")]
         let subscribed = if let Some(state) = self.services.app_state.as_ref() {
             let mut shared = state.session.lock().await;
-            if let Some(compositor) = shared.compositor.as_mut() {
+            if let Some(compositor) = shared
+                .compositor
+                .as_mut()
+                .filter(|compositor| compositor.audio_output_enabled)
+            {
                 compositor.audio_broadcast.subscribe_native(
                     backend_owner,
                     request.target_bitrate_kbps,
@@ -12759,11 +12760,10 @@ impl Session {
                 );
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                 }
                 true
             } else {
@@ -14472,35 +14472,50 @@ impl Session {
                     // engine initializes this field at zero, so creation sets
                     // the first public generation explicitly.
                     pty.generation = 1;
+                    pty.native_launch = Some(request.launch.clone());
                     pty.deadline = prepared.deadline_after_ns.and_then(|ns| {
                         std::time::Instant::now().checked_add(Duration::from_nanos(ns))
                     });
                 }
-                pty.and_then(|pty| {
-                    let lifecycle = session.note_terminal_created(pty_id, pty.generation)?;
-                    debug_assert_eq!(lifecycle.backend_id(), pty_id);
-                    debug_assert_eq!(lifecycle.generation(), pty.generation);
-                    let handle = lifecycle.terminal_handle();
-                    session.ptys.insert(pty_id, pty);
-                    Some((handle, pty_id))
-                })
+                match pty {
+                    Some(pty) => session
+                        .note_terminal_created(pty_id, pty.generation)
+                        .map(|lifecycle| {
+                            debug_assert_eq!(lifecycle.backend_id(), pty_id);
+                            debug_assert_eq!(lifecycle.generation(), pty.generation);
+                            let handle = lifecycle.terminal_handle();
+                            session.ptys.insert(pty_id, pty);
+                            (handle, pty_id)
+                        })
+                        .ok_or(Status::ResourceExhausted),
+                    None if super::pty::launch_program_missing(
+                        prepared.spec.borrowed(&argv),
+                        &state,
+                        session_env.as_ref(),
+                    ) =>
+                    {
+                        Err(Status::NotFound)
+                    }
+                    None => Err(Status::ResourceExhausted),
+                }
             } else {
-                None
+                Err(Status::ResourceExhausted)
             }
         };
-        let Some((terminal_handle, pty_id)) = created else {
-            self.record_terminal_replay(
-                yas_wire::schema::terminal::request::CREATE,
-                request.operation_id,
-                fingerprint,
-                Status::ResourceExhausted,
-                Vec::new(),
-                None,
-                None,
-            );
-            return self
-                .send_sensitive_result(&frame, Status::ResourceExhausted, Vec::new())
-                .await;
+        let (terminal_handle, pty_id) = match created {
+            Ok(created) => created,
+            Err(status) => {
+                self.record_terminal_replay(
+                    yas_wire::schema::terminal::request::CREATE,
+                    request.operation_id,
+                    fingerprint,
+                    status,
+                    Vec::new(),
+                    None,
+                    None,
+                );
+                return self.send_sensitive_result(&frame, status, Vec::new()).await;
+            }
         };
         let initial_view_result = if let Some(initial_view) = initial_view {
             match self
@@ -14536,7 +14551,6 @@ impl Session {
         };
         self.refresh_terminal_catalogue().await;
         let terminal = self.native.as_mut().ok_or(())?;
-        terminal.launches.insert(terminal_handle, request.launch);
         if let Some(app_handle) = app_handle {
             terminal.app_handles.insert(terminal_handle, app_handle);
         }
@@ -14658,11 +14672,14 @@ impl Session {
             return self.send_result(&frame, Status::NotFound, Vec::new()).await;
         };
         let launch = match request.launch_mode {
-            yas_terminal::LaunchMode::Replay => self
-                .native
-                .as_ref()
-                .and_then(|terminal| terminal.launches.get(&request.terminal_handle))
-                .cloned(),
+            yas_terminal::LaunchMode::Replay => {
+                let state = self.native.as_ref().ok_or(())?.state.clone();
+                let session = state.session.lock().await;
+                session
+                    .ptys
+                    .get(&pty_id)
+                    .and_then(|pty| pty.native_launch.clone())
+            }
             yas_terminal::LaunchMode::Replace => request.launch.take(),
         };
         let Some(mut launch) = launch else {
@@ -14755,7 +14772,7 @@ impl Session {
                 .send_sensitive_result(&frame, Status::NotFound, Vec::new())
                 .await;
         }
-        let (succeeded, invalidated_views) = {
+        let (failure, invalidated_views) = {
             let mut session = state.session.lock().await;
             let current = session.ptys.get(&pty_id).ok_or(())?;
             let (rows, cols) = current.driver.size();
@@ -14806,15 +14823,25 @@ impl Session {
                     .ok_or(())?;
                 debug_assert_eq!(lifecycle.backend_id(), pty_id);
                 debug_assert_eq!(lifecycle.generation(), generation);
-                (true, true)
+                (None, true)
             } else {
                 let invalidated = request.cutover_mode == yas_terminal::CutoverMode::StopThenStart;
                 if invalidated {
                     session.native_terminal_views.refresh_backend(pty_id);
                 }
-                (false, invalidated)
+                let status = if super::pty::launch_program_missing(
+                    prepared.spec.borrowed(&argv),
+                    &state,
+                    session_env.as_ref(),
+                ) {
+                    Status::NotFound
+                } else {
+                    Status::Io
+                };
+                (Some(status), invalidated)
             }
         };
+        let succeeded = failure.is_none();
         let receipts = if invalidated_views {
             let terminal = self.native.as_mut().ok_or(())?;
             terminal
@@ -14833,7 +14860,7 @@ impl Session {
             Vec::new()
         };
         self.drain_terminal_frame_receipts(receipts).await?;
-        if !succeeded {
+        if let Some(status) = failure {
             if request.cutover_mode == yas_terminal::CutoverMode::StopThenStart
                 && self.refresh_terminal_catalogue().await
             {
@@ -14843,20 +14870,20 @@ impl Session {
                 yas_wire::schema::terminal::request::RESTART,
                 request.operation_id,
                 fingerprint,
-                Status::Io,
+                status,
                 Vec::new(),
                 None,
                 Some(request.terminal_handle),
             );
-            return self
-                .send_sensitive_result(&frame, Status::Io, Vec::new())
-                .await;
+            return self.send_sensitive_result(&frame, status, Vec::new()).await;
+        }
+        if request.launch_mode == yas_terminal::LaunchMode::Replace
+            && let Some(pty) = state.session.lock().await.ptys.get_mut(&pty_id)
+        {
+            pty.native_launch = Some(launch);
         }
         self.refresh_terminal_catalogue().await;
         let terminal = self.native.as_mut().ok_or(())?;
-        if request.launch_mode == yas_terminal::LaunchMode::Replace {
-            terminal.launches.insert(request.terminal_handle, launch);
-        }
         match app_handle {
             Some(app_handle) => {
                 terminal
@@ -14989,7 +15016,6 @@ impl Session {
             return self.send_result(&frame, Status::NotFound, Vec::new()).await;
         }
         if let Some(terminal) = self.native.as_mut() {
-            terminal.launches.remove(&request.terminal_handle);
             terminal.app_handles.remove(&request.terminal_handle);
         }
         if self.refresh_terminal_catalogue().await {
@@ -26292,11 +26318,10 @@ impl Session {
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                     // Publish even when the remaining current maximum is
                     // zero: the removed report may have expired before the
                     // maintenance tick cleared its advertised latency.
@@ -27591,9 +27616,6 @@ impl Session {
             terminal
                 .app_handles
                 .retain(|handle, _| snapshot.records.contains_key(handle));
-            terminal
-                .launches
-                .retain(|handle, _| snapshot.records.contains_key(handle));
             // And the deduplication entries that named those terminals: the
             // replay guarantee runs to the end of the affected resource's
             // lifetime, which this is.
@@ -28384,11 +28406,10 @@ impl Session {
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                     // Publish even when the remaining current maximum is
                     // zero: the removed report may have expired before the
                     // maintenance tick cleared its advertised latency.
@@ -32128,25 +32149,7 @@ async fn run_git_watch(
     journal: Option<super::watch_diagnostics::WatchJournal>,
 ) {
     let mut sent_bytes = 0u64;
-    if send_git_snapshot(
-        subscription_id,
-        revision,
-        Vec::new(),
-        event_limit,
-        &mut sent_bytes,
-        &control,
-        &out,
-        &cancellation,
-        journal.as_ref(),
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    if let Some(journal) = &journal {
-        journal.state(revision, 0, sent_bytes);
-    }
+    let mut initial = true;
     loop {
         let event = tokio::select! {
             event = watch.next() => event,
@@ -32170,9 +32173,32 @@ async fn run_git_watch(
                 return;
             }
             Ok(super::yas_git_adapter::WatchEvent::Snapshot { state_id, records }) => {
-                let next = revision.saturating_add(1).max(1);
                 let before = sent_bytes;
                 let count = records.len();
+                if std::mem::take(&mut initial) {
+                    if send_git_snapshot(
+                        subscription_id,
+                        revision,
+                        records,
+                        event_limit,
+                        &mut sent_bytes,
+                        &control,
+                        &out,
+                        &cancellation,
+                        journal.as_ref(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(journal) = &journal {
+                        journal.state(revision, count, sent_bytes - before);
+                    }
+                    watch.acknowledge(state_id);
+                    continue;
+                }
+                let next = revision.saturating_add(1).max(1);
                 if send_git_state_event(
                     subscription_id,
                     Phase::Reset,
@@ -32232,12 +32258,43 @@ async fn run_lsp_watch(
     let mut revision = 1u64;
     let mut backend = Vec::new();
     let mut diagnostics = Vec::new();
+    // The engine replays its retained diagnostics as the first Diagnostics
+    // update, so waiting for it lets the initial snapshot carry them rather
+    // than an empty set that a one-shot reader would take as clean.
+    let mut initial_acks = Vec::new();
+    if watch.wants_diagnostics() {
+        loop {
+            let event = tokio::select! {
+                event = watch.next() => event,
+                _ = cancellation.cancelled() => return,
+            };
+            let Some(Ok(super::yas_lsp_adapter::WatchEvent::Snapshot {
+                stream,
+                update_id,
+                entities,
+            })) = event
+            else {
+                return;
+            };
+            initial_acks.push((stream, update_id));
+            match stream {
+                super::yas_lsp_adapter::WatchStream::Backend => backend = entities,
+                super::yas_lsp_adapter::WatchStream::Diagnostics => {
+                    diagnostics = entities;
+                    break;
+                }
+            }
+        }
+    }
+    let mut initial = session
+        .buffer_snapshot(workspace_handle)
+        .unwrap_or_default();
+    initial.extend(backend.iter().cloned());
+    initial.extend(diagnostics.iter().cloned());
     if send_lsp_snapshot(
         subscription_id,
         revision,
-        session
-            .buffer_snapshot(workspace_handle)
-            .unwrap_or_default(),
+        initial,
         event_limit,
         &mut sent_bytes,
         &control,
@@ -32248,6 +32305,9 @@ async fn run_lsp_watch(
     .is_err()
     {
         return;
+    }
+    for (stream, update_id) in initial_acks {
+        watch.acknowledge(stream, update_id);
     }
     enum Input {
         Backend(Option<Result<super::yas_lsp_adapter::WatchEvent, super::yas_lsp_adapter::Error>>),
@@ -33614,7 +33674,7 @@ fn rebuild_media_devices(runtime: &mut MediaRuntime) -> bool {
         old.get(&MEDIA_OUTPUT_DEVICE_HANDLE),
         MEDIA_OUTPUT_DEVICE_HANDLE,
         yas_wire::schema::media::KIND_AUDIO_OUTPUT as u8,
-        backend.is_some_and(|state| state.pipewire_available),
+        backend.is_some_and(|state| state.audio_output_available),
         "Default audio output",
         vec![media_audio_format(
             yas_wire::schema::media::CODEC_OPUS as u16,
@@ -40228,6 +40288,113 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_watch_initial_snapshot_carries_worktree_status() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join("hello.txt"), b"hello\n").unwrap();
+        git(&["add", "hello.txt"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(root.path().join("hello.txt"), b"changed\n").unwrap();
+
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::GIT]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+            &yas_git_wire::Open {
+                source: yas_git_wire::RepositorySource::PlatformPath(
+                    root.path().to_string_lossy().as_bytes().to_vec(),
+                ),
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::OPEN,
+            10,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let repository_handle = yas_git_wire::OpenResult::decode(&opened.body)
+            .unwrap()
+            .repository_handle;
+        write_request(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::WATCH,
+            11,
+            &yas_git_wire::Watch {
+                repository_handle,
+                datasets: (yas_wire::schema::git::WATCH_HEAD | yas_wire::schema::git::WATCH_STATUS)
+                    as u16,
+                state: Watch {
+                    initial_credit: 1024 * 1024,
+                    resume: None,
+                    extensions: Extensions::default(),
+                },
+            },
+        )
+        .await;
+        let watched = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::GIT,
+            yas_git_wire::request_kind::WATCH,
+            11,
+        )
+        .await;
+        assert_eq!(watched.status, Status::Ok);
+        let mut entities = Vec::new();
+        loop {
+            let frame = timeout(TEST_TIMEOUT, next_frame(&mut client, &codec))
+                .await
+                .unwrap();
+            assert_eq!(frame.header.kind, yas_git_wire::event_kind::STATE);
+            let event = StateEvent::decode(&frame.payload).unwrap();
+            assert_ne!(event.phase, Phase::Reset);
+            for record in &event.records {
+                entities.push(yas_git_wire::EntityRecord::decode(&record.body).unwrap());
+            }
+            if event.phase == Phase::SnapshotEnd {
+                break;
+            }
+        }
+        assert!(
+            entities
+                .iter()
+                .any(|entity| matches!(entity.body, yas_git_wire::EntityBody::Head(_)))
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|entity| matches!(entity.body, yas_git_wire::EntityBody::Status(_)))
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn extension_installation_support_matches_server_policy() {
         for persistent in [false, true] {
@@ -41523,7 +41690,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .native_media_state_override = Some(super::super::MediaBackendState {
-                pipewire_available: true,
+                audio_output_available: true,
                 microphone_available: false,
                 camera_available: false,
                 screencasts: Vec::new(),
@@ -47881,7 +48048,7 @@ mod tests {
             let compositor = shared.compositor.as_mut().unwrap();
             compositor.audio_broadcast = super::super::audio::AudioBroadcast::new();
             compositor.native_media_state_override = Some(super::super::MediaBackendState {
-                pipewire_available: true,
+                audio_output_available: true,
                 microphone_available: false,
                 camera_available: false,
                 screencasts: Vec::new(),
@@ -52089,6 +52256,143 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_output_past_end_is_empty_and_command_wait_times_out() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::TERMINAL]).await;
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x43; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"printf 'ready\\n'; exec cat".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let mut frames = Vec::new();
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &mut frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+            &yas_terminal::Output {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                cursor_kind: yas_wire::schema::terminal::OUTPUT_CURSOR_SEQUENCE as u8,
+                flags: yas_wire::schema::terminal::OUTPUT_REQUEST_FLAGS as u8,
+                cursor_a: 1_000_000,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let output = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OUTPUT,
+            11,
+        )
+        .await;
+        assert_eq!(output.status, Status::Ok);
+        let yas_terminal::QueryDelivery::Inline(bytes) =
+            yas_terminal::QueryBody::decode(&output.body)
+                .unwrap()
+                .delivery
+        else {
+            panic!("an empty OUTPUT answer is inline");
+        };
+        let output = yas_terminal::OutputResult::decode(&bytes).unwrap();
+        assert!(output.text.is_empty());
+        assert!(output.next_seq < 1_000_000);
+        assert_eq!(
+            (output.start_seq, output.start_col),
+            (output.next_seq, output.next_col)
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::WAIT,
+            12,
+            &yas_terminal::Wait {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                wait_kind: yas_wire::schema::terminal::WAIT_LATEST_COMMAND as u8,
+                flags: yas_wire::schema::terminal::WAIT_FLAGS as u8,
+                cursor_a: 0,
+                cursor_b: 0,
+                max_bytes: 64 * 1024,
+                timeout_ns: 200_000_000,
+                needle: Vec::new(),
+                initial_receive_credit: 64 * 1024,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut client,
+                &codec,
+                family::TERMINAL,
+                yas_wire::schema::terminal::request::WAIT,
+                12,
+            )
+            .await
+            .status,
+            Status::Timeout,
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+        delivery.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn terminal_cwd_rejects_under_credit_and_remains_live_at_exact_credit() {
         let state = super::super::tests::process_transport::test_state(
             super::super::process::Server::new(false, true),
@@ -53475,7 +53779,7 @@ mod tests {
             )
             .await
             .status,
-            Status::Io,
+            Status::NotFound,
         );
         {
             let shared = state.session.lock().await;
@@ -53544,7 +53848,7 @@ mod tests {
             )
             .await
             .status,
-            Status::Io,
+            Status::NotFound,
         );
         {
             let shared = state.session.lock().await;
@@ -53673,6 +53977,148 @@ mod tests {
             Status::Ok,
         );
 
+        drop(client);
+        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_restart_replays_across_connections_and_missing_programs_are_not_found() {
+        let process_service = super::super::process::Server::new(false, true);
+        let state = super::super::tests::process_transport::test_state(process_service.clone());
+        let (mut creator, creator_codec, _, creator_task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut creator_frames = Vec::new();
+        write_request(
+            &mut creator,
+            &creator_codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x5a; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"/bin/sh".to_vec(),
+                        b"-c".to_vec(),
+                        b"exit 3".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let created = next_terminal_result(
+            &mut creator,
+            &creator_codec,
+            yas_wire::schema::terminal::request::CREATE,
+            10,
+            &mut creator_frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+        drop(creator);
+        timeout(TEST_TIMEOUT, creator_task).await.unwrap().unwrap();
+
+        let (mut client, codec, _, task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut frames = Vec::new();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::RESTART,
+            11,
+            &yas_terminal::Restart {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x5b; 16],
+                launch_mode: yas_terminal::LaunchMode::Replay,
+                cutover_mode: yas_terminal::CutoverMode::StopThenStart,
+                launch: None,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let restarted = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::RESTART,
+            11,
+            &mut frames,
+        )
+        .await;
+        assert_eq!(restarted.status, Status::Ok);
+        let restarted = yas_terminal::RestartResult::decode(&restarted.body).unwrap();
+        assert!(restarted.generation > created.generation);
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            13,
+            &yas_terminal::Create {
+                rows: 24,
+                cols: 80,
+                operation_id: [0x5d; 16],
+                launch: yas_terminal::Launch {
+                    command: yas_terminal::Command::Argv(vec![
+                        b"definitely-not-a-yas-terminal-program".to_vec(),
+                    ]),
+                    cwd: yas_terminal::Cwd::ServerDefault,
+                    environment_base: yas_terminal::EnvironmentBase::Server,
+                    environment: Vec::new(),
+                    extensions: Extensions::default(),
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CREATE,
+                13,
+                &mut frames,
+            )
+            .await
+            .status,
+            Status::NotFound,
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            12,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x5c; 16],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CLOSE,
+                12,
+                &mut frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
         drop(client);
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
         process_service.shutdown().await;
