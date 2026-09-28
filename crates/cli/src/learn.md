@@ -131,7 +131,7 @@ a resulting State update. See `docs/events.md` for payload layouts and timing co
 ## Commands in a live shell
 
 A shell that emits OSC 133 records each command (see
-`docs/shell-integration.md`). Without that, the journal is empty.
+https://docs.yas.run/terminals/shell-integration). Without that, the journal is empty.
 
 ```bash
 yas terminal send "$ID" "cargo test\n"
@@ -254,9 +254,9 @@ conflict rather than a silent clobber (exit 1):
 echo hi | yas fs write notes.txt              # unconditional overwrite
 echo hi | yas fs write notes.txt --create     # fail if it exists
 echo hi | yas fs write notes.txt --if-hash H  # only if unchanged
-yas fs mkdir -p a/b        # create a directory
+yas fs mkdir --parents a/b # create a directory
 yas fs mv old new          # rename or move
-yas fs rm -r dir           # remove a subtree
+yas fs rm dir              # remove a file or subtree
 yas fs ln -s target link   # symlink (omit -s for a hard link)
 ```
 
