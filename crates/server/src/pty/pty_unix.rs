@@ -1691,6 +1691,61 @@ mod tests {
         assert!(reaped, "group kill missed the pre-setsid child");
     }
 
+    /// A signal that reaches a forked child before `execve` takes its
+    /// default action. Until exec the child carries the server's handlers,
+    /// and the server catches SIGTERM (its own shutdown): a SIGTERM that a
+    /// client sent right after starting or restarting a terminal ran that
+    /// handler in the child and was lost, and the program the child became
+    /// kept running.
+    #[test]
+    fn a_signal_before_exec_takes_its_default_action() {
+        extern "C" fn caught(_: libc::c_int) {}
+        // Catch SIGTERM as the server does, for as long as the test runs.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = caught as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGTERM, &action, &mut previous) },
+            0
+        );
+
+        let pid = super::fork_child();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Where a PTY child would still be setting up.
+            unsafe {
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let mut status = 0;
+        let mut reaped = false;
+        for _ in 0..500 {
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !reaped {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        unsafe { libc::sigaction(libc::SIGTERM, &previous, std::ptr::null_mut()) };
+        assert!(
+            reaped,
+            "the child swallowed SIGTERM with the parent's handler"
+        );
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
+            "status {status:#x}"
+        );
+    }
+
     /// Exit detection must not depend on the master fd reaching EOF: a
     /// grandchild holding the slave open keeps a dead terminal marked
     /// running forever.  `poll_child_exited` answers from the child itself.
