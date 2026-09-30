@@ -1017,10 +1017,100 @@ fn events_read_as_yas_uplink_prints_them() {
         Event::ReceiveBuffer { bytes: 16 << 20 }.to_string(),
         "UDP receive buffer: 16777216 bytes"
     );
+    // Linux reports double what it allows: all 8 MiB reads as 16 MiB, and
+    // 8 MiB is what a 4 MiB net.core.rmem_max allows.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    for (bytes, note) in [
+        (8 << 20, "8388608 bytes"),
+        (15_000_000, "15000000 bytes"),
+        (425_984, "425984 bytes"),
+    ] {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes }.to_string(),
+            format!(
+                "UDP receive buffer: {note}, under the 16777216 Linux reports for the \
+                 8388608 asked for (net.core.rmem_max caps it)"
+            )
+        );
+    }
+    // macOS reports what it allows, and takes at most 2048/2304 of
+    // kern.ipc.maxsockbuf (8 MiB unless raised).
+    #[cfg(target_vendor = "apple")]
+    {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 8 << 20 }.to_string(),
+            "UDP receive buffer: 8388608 bytes"
+        );
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 7_456_540 }.to_string(),
+            "UDP receive buffer: 7456540 bytes, under the 8388608 asked for \
+             (kern.ipc.maxsockbuf caps it)"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 8 << 20 }.to_string(),
+            "UDP receive buffer: 8388608 bytes"
+        );
+        assert_eq!(
+            Event::ReceiveBuffer { bytes: 65_536 }.to_string(),
+            "UDP receive buffer: 65536 bytes, under the 8388608 asked for \
+             (the system caps it)"
+        );
+    }
+}
+
+/// macOS and the BSDs refuse a receive buffer over their cap rather than cap
+/// it, keeping their default: the uplink finds the most they take.
+#[test]
+fn receive_buffers_get_the_most_a_refusing_system_takes() {
+    // macOS's sbreserve takes up to kern.ipc.maxsockbuf × MCLBYTES / (MSIZE +
+    // MCLBYTES), from a default of net.inet.udp.recvspace.
+    let cap = (8 << 20) * 2048 / 2304;
+    assert_eq!(cap, 7_456_540);
+    let mut buffer = 786_896;
+    let mut tries = 0;
+    let got = largest_taken(buffer, RECEIVE_BUFFER, |size| {
+        tries += 1;
+        let taken = size <= cap;
+        if taken {
+            buffer = size;
+        }
+        taken
+    });
+    assert_eq!((got, buffer), (cap, cap));
+    assert!(tries <= 23, "{tries} tries");
+    // A system taking nothing over its default keeps it, and one whose
+    // default is already as large isn't asked again.
+    assert_eq!(largest_taken(786_896, RECEIVE_BUFFER, |_| false), 786_896);
     assert_eq!(
-        Event::ReceiveBuffer { bytes: 425_984 }.to_string(),
-        "UDP receive buffer: 425984 bytes, under the 8388608 asked for \
-         (the system caps it: net.core.rmem_max on Linux)"
+        largest_taken(16 << 20, RECEIVE_BUFFER, |_| unreachable!()),
+        16 << 20
+    );
+}
+
+/// On Linux, the uplink's socket gets as much of its ask as
+/// net.core.rmem_max allows (reported doubled), and the event notes a cap
+/// exactly when there is one.
+#[cfg(target_os = "linux")]
+#[test]
+fn receive_buffers_note_linux_caps() {
+    // Only the initial network namespace shows it.
+    let Some(rmem_max) = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+        .ok()
+        .and_then(|max| max.trim().parse::<usize>().ok())
+    else {
+        return;
+    };
+    let socket = udp_socket((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let bytes = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+    assert_eq!(bytes, 2 * rmem_max.min(RECEIVE_BUFFER));
+    let event = Event::ReceiveBuffer { bytes }.to_string();
+    assert_eq!(
+        event.contains("net.core.rmem_max caps it"),
+        rmem_max < RECEIVE_BUFFER,
+        "rmem_max {rmem_max}: {event}"
     );
 }
 
