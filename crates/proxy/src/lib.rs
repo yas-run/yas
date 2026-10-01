@@ -787,10 +787,26 @@ pub mod uplink_producer;
 /// HTTPS control client with the same explicit CA override semantics as the
 /// WSS and WebTransport legs. Reqwest's platform verifier otherwise ignores
 /// SSL_CERT_FILE/SSL_CERT_DIR on macOS.
+/// How long an uplink HTTP request may take to reach its endpoint (TCP and TLS).
+const UPLINK_CONNECT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a consumer's `/attach` may take in all: the control plane holds it
+/// while the uplink connects (Ultimator's relay, 8 seconds at most), and a
+/// load balancer may try another backend once one doesn't answer.
+const UPLINK_ATTACH: std::time::Duration = std::time::Duration::from_secs(25);
+/// How long a consumer's worker WebSocket may take to open and admit its
+/// token: the relay asks the uplink for a stream meanwhile (Ultimator's, 10
+/// seconds at most).
+const UPLINK_WORKER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The HTTP client for uplink control requests (producers' pool, consumers'
+/// `/attach`): HTTPS only, no redirects, and connections given up after
+/// [`UPLINK_CONNECT`], since a relay on a host that froze takes them and never
+/// answers. Each request sets its own overall timeout.
 pub fn uplink_http_client() -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .https_only(true)
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(UPLINK_CONNECT);
     if std::env::var_os("SSL_CERT_FILE").is_some() || std::env::var_os("SSL_CERT_DIR").is_some() {
         let roots = rustls_native_certs::load_native_certs();
         if roots.certs.is_empty() {
@@ -814,42 +830,68 @@ pub fn uplink_http_client() -> Result<reqwest::Client, String> {
 /// uplink is connected), then attach over WebSocket with the token as the
 /// auth passphrase.  The token is a credential — never log it.
 async fn connect_uplink(rest: &str) -> Result<UpstreamConn, String> {
+    connect_uplink_within(rest, UPLINK_ATTACH, UPLINK_WORKER).await
+}
+
+/// [`connect_uplink`], giving up on `/attach` after `attach` and on the
+/// worker WebSocket after `worker`, so that the caller tries again rather
+/// than waiting on a relay that never answers.
+async fn connect_uplink_within(
+    rest: &str,
+    attach: std::time::Duration,
+    worker: std::time::Duration,
+) -> Result<UpstreamConn, String> {
     let target = parse_uplink_uri(rest)?;
     let crypto = target.identity.client_config(target.server)?;
+    let failed = |error: reqwest::Error| {
+        if error.is_timeout() {
+            format!("uplink: attach request timed out after {attach:?}")
+        } else {
+            "uplink: attach request failed".to_owned()
+        }
+    };
     let resp = uplink_http_client()?
         .get(target.control)
         .header("authorization", format!("Bearer {}", target.token))
         .header("accept", "application/json")
+        .timeout(attach)
         .send()
         .await
-        .map_err(|_| "uplink: attach request failed")?;
+        .map_err(failed)?;
     match resp.status().as_u16() {
         200 => {}
         401 | 403 => return Err("uplink: token rejected".into()),
         404 => return Err("uplink: session has no connected uplink".into()),
         s => return Err(format!("uplink: attach HTTP {s}")),
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|_| "uplink: invalid attach response")?;
+    let body: serde_json::Value = resp.json().await.map_err(|error| {
+        if error.is_timeout() {
+            failed(error)
+        } else {
+            "uplink: invalid attach response".to_owned()
+        }
+    })?;
     let ws = body
         .get("ws")
         .and_then(|v| v.as_str())
         .ok_or("uplink: attach response missing ws")?;
-    let worker = url::Url::parse(ws).map_err(|_| "uplink: invalid worker URL")?;
-    if worker.scheme() != "wss"
-        || !worker.username().is_empty()
-        || worker.password().is_some()
-        || worker.fragment().is_some()
+    let worker_url = url::Url::parse(ws).map_err(|_| "uplink: invalid worker URL")?;
+    if worker_url.scheme() != "wss"
+        || !worker_url.username().is_empty()
+        || worker_url.password().is_some()
+        || worker_url.fragment().is_some()
     {
         return Err("uplink: worker URL must be WSS without userinfo or a fragment".into());
     }
     // The worker carries opaque Noise records, not standalone yas.v1 messages.
     // Suppress worker-controlled URLs and error text, which may contain tokens.
-    let conn = connect_ws_mode(worker.as_str(), Some(&target.token), WsMode::Bytes)
-        .await
-        .map_err(|_| "uplink: worker connection failed")?;
+    let conn = tokio::time::timeout(
+        worker,
+        connect_ws_mode(worker_url.as_str(), Some(&target.token), WsMode::Bytes),
+    )
+    .await
+    .map_err(|_| format!("uplink: worker connection timed out after {worker:?}"))?
+    .map_err(|_| "uplink: worker connection failed")?;
     let stream = tokio::io::join(conn.reader, conn.writer);
     let stream = yas_uplink::connect(stream, crypto)
         .await
@@ -2243,6 +2285,41 @@ mod tests {
         }
         assert!(parse_uplink_uri("https://relay.example#").is_err());
         assert!(parse_uplink_uri("#tok123").is_err());
+    }
+
+    #[tokio::test]
+    async fn uplink_attach_gives_up_on_a_relay_that_never_answers() {
+        yas_webrtc_forwarder::tls::install_default_provider();
+        // A relay on a host that froze: it takes the connection, then says nothing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut taken = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                taken.push(stream);
+            }
+        });
+        let (private, public) = yas_uplink::Identity::generate().unwrap();
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("token", "secret")
+            .append_pair("server", &public.to_string())
+            .append_pair("identity", private.as_str())
+            .finish();
+        let uri = format!("https://127.0.0.1:{port}/#{fragment}");
+        let started = std::time::Instant::now();
+        let error = match connect_uplink_within(
+            &uri,
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        {
+            Ok(_) => panic!("attached through a relay that never answers"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "uplink: attach request timed out after 300ms");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        held.abort();
     }
 
     #[test]

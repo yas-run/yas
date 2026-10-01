@@ -95,6 +95,10 @@ const RECEIVE_BUFFER_CAP: &str = if REPORTS_DOUBLE {
 };
 /// How long a WebSocket (session or stream) may take to open.
 const WEBSOCKET_CONNECT: Duration = Duration::from_secs(10);
+/// How long the control request may take in all. The control plane answers
+/// at once; one on a host that froze takes the connection and never does, and
+/// a load balancer may try another backend first.
+const CONTROL_REQUEST: Duration = Duration::from_secs(15);
 /// How long [`Transport::Auto`] waits for a WebTransport session before it
 /// tries the pool's WebSocket relays. Where UDP is dropped rather than
 /// refused, QUIC would otherwise wait out its whole idle timeout.
@@ -499,7 +503,7 @@ impl Producer {
         let mut prefer_websocket_until: Option<Instant> = None;
         loop {
             let token = self.shared.token();
-            let pool = match fetch_pool(&http, &self.control, &token).await? {
+            let pool = match fetch_pool(&http, &self.control, &token, CONTROL_REQUEST).await? {
                 FetchOutcome::Pool(pool) => pool,
                 FetchOutcome::Retry { after, reason } => {
                     let delay = after.unwrap_or(backoff);
@@ -816,22 +820,26 @@ enum FetchOutcome {
     },
 }
 
-/// Query the control endpoint. `Err` is fatal (bad token); every other
-/// failure is a retryable `FetchOutcome::Retry`.
+/// Query the control endpoint, giving up after `deadline`. `Err` is fatal
+/// (bad token); every other failure is a retryable `FetchOutcome::Retry`.
 async fn fetch_pool(
     http: &reqwest::Client,
     url: &url::Url,
     token: &str,
+    deadline: Duration,
 ) -> Result<FetchOutcome, String> {
     let retry = |after, reason| Ok(FetchOutcome::Retry { after, reason });
+    let silent = || format!("control endpoint gave no answer within {deadline:?}");
     let response = match http
         .get(url.clone())
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/json")
+        .timeout(deadline)
         .send()
         .await
     {
         Ok(response) => response,
+        Err(error) if error.is_timeout() => return retry(None, silent()),
         Err(error) => return retry(None, format!("control endpoint unreachable: {error}")),
     };
     let status = response.status();
@@ -851,6 +859,7 @@ async fn fetch_pool(
     }
     let body = match response.text().await {
         Ok(body) => body,
+        Err(error) if error.is_timeout() => return retry(None, silent()),
         Err(error) => return retry(None, format!("error reading relay pool: {error}")),
     };
     match parse_pool(&body) {

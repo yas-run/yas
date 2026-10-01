@@ -829,6 +829,37 @@ async fn webtransport_gives_up_quickly_where_udp_goes_nowhere() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+#[tokio::test]
+async fn control_requests_give_up_on_a_control_plane_that_never_answers() {
+    yas_webrtc_forwarder::tls::install_default_provider();
+    // A control plane on a host that froze: it takes the connection, then says nothing.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url: url::Url = format!(
+        "https://127.0.0.1:{}/uplink/control",
+        listener.local_addr().unwrap().port()
+    )
+    .parse()
+    .unwrap();
+    let held = tokio::spawn(async move {
+        let mut taken = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            taken.push(stream);
+        }
+    });
+    let http = crate::uplink_http_client().unwrap();
+    let started = Instant::now();
+    match fetch_pool(&http, &url, "token", Duration::from_millis(300)).await {
+        Ok(FetchOutcome::Retry { after, reason }) => {
+            assert_eq!(after, None);
+            assert_eq!(reason, "control endpoint gave no answer within 300ms");
+        }
+        Ok(FetchOutcome::Pool(_)) => panic!("a pool from a control plane that never answers"),
+        Err(error) => panic!("a silent control plane is retried, not fatal: {error}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    held.abort();
+}
+
 #[test]
 fn parse_pool_accepts_plain_and_pinned_relay_urls() {
     let pool = parse_pool(

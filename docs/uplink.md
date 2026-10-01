@@ -181,9 +181,13 @@ A success response is the **relay pool**:
 Error handling:
 
 - `401`/`403` — the token is bad; fatal, the uplink exits.
-- Any other failure (unreachable, non-2xx, malformed body) — retried
-  with exponential backoff, 1s doubling to a 60s cap, with 0.75×–1.25×
-  jitter. A `Retry-After` header (seconds) overrides the backoff delay.
+- Any other failure (unreachable, non-2xx, malformed body, no answer) —
+  retried with exponential backoff, 1s doubling to a 60s cap, with
+  0.75×–1.25× jitter. A `Retry-After` header (seconds) overrides the backoff
+  delay.
+- The request gets **10 seconds** to connect (TCP and TLS) and **15 seconds**
+  in all. A control plane on a host that froze takes the connection and never
+  answers; the uplink tries again rather than wait on it.
 
 ## Consumer attachment
 
@@ -217,7 +221,13 @@ The client disables HTTP redirects. `/attach` waits for the uplink and returns:
 ```
 
 The client connects to this WSS worker using the existing bearer-token/`ok`
-exchange, then starts Noise over its binary byte stream. WebSocket messages
+exchange, then starts Noise over its binary byte stream.
+
+`/attach` gets **10 seconds** to connect and **25 seconds** in all (the
+control plane may hold it while the uplink connects), and the worker
+WebSocket **20 seconds** to open and answer `ok` (the relay may wait for the
+uplink to open a stream). Past either, the attempt fails, and the caller tries
+again as after any failure, rather than waiting on a relay that never answers. WebSocket messages
 are opaque chunks of at most 64 KiB; their boundaries have no inner meaning.
 The built-in consumer sends chunks of at most 16 KiB. Worker allocation
 and bearer authentication provide routing only. The pinned server and allowed
