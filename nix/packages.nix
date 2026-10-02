@@ -247,8 +247,8 @@
       # ------------------------------------------------------------------
 
       # Cargo feature flags for the GPL flavor: x264 instead of openh264 (and the
-      # browser UI, a default feature too).
-      gplFeatureArgs = "--no-default-features --features x264,ui";
+      # browser UI and mimalloc, default features too).
+      gplFeatureArgs = "--no-default-features --features x264,ui,mimalloc";
 
       # Linux glibc binary — all deps statically linked, only glibc is
       # dynamic (so dlopen works for GPU).  Built with cargo-zigbuild

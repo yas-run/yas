@@ -446,7 +446,9 @@ fn main() {
 - Without the `ui` feature (a default one), the browser UI that `yas edge`
   serves and a bare `yas` opens is a page saying this build carries none, and
   the build needs no `js/ui/dist`.
-  `openh264` and `x264` are the CLI's video encoders, as for `yas` itself.
+  `openh264` and `x264` are the CLI's video encoders, as for `yas` itself;
+  `mimalloc` (default too) is the `yas` binary's allocator, which a program
+  that carries the CLI leaves out and picks its own.
 
 ## Server-side: a Node/Bun client over a unix socket
 
