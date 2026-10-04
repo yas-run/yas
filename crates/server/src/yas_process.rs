@@ -248,7 +248,7 @@ impl ExitReplays {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn get(&self, process_handle: u64) -> Option<&ExitInfo> {
         self.values.get(&process_handle)
     }
