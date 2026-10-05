@@ -364,12 +364,24 @@ impl Net {
         if !address.is_datagram() {
             return Err(Error::invalid("a stream address opens a NetStream"));
         }
-        for kind in [wire::event_kind::DATAGRAM, wire::event_kind::DATAGRAM_STATS] {
-            if !self.client.supports(family::NET, Class::Event, kind) {
-                return Err(Error::Unsupported(
-                    "this YAS session does not offer Net datagrams".into(),
-                ));
-            }
+        let stats_sent = self
+            .client
+            .hello()
+            .families
+            .iter()
+            .find(|descriptor| descriptor.family_id == family::NET)
+            .and_then(|descriptor| {
+                descriptor.operation(Class::Event, wire::event_kind::DATAGRAM_STATS)
+            })
+            .is_some_and(|operation| operation.server_sends);
+        if !stats_sent
+            || !self
+                .client
+                .supports(family::NET, Class::Event, wire::event_kind::DATAGRAM)
+        {
+            return Err(Error::Unsupported(
+                "this YAS session does not offer Net datagrams".into(),
+            ));
         }
         let native = self.client.supports_datagrams();
         let target = describe(&address);
@@ -582,8 +594,47 @@ pub struct NetStream {
     write_closed: bool,
     failed: Option<Error>,
     released: bool,
-    read_waker: Option<Waker>,
-    write_waker: Option<Waker>,
+    /// The reading and the writing task (one, or two after `tokio::io::split`).
+    wakers: Arc<Wakers>,
+    /// Polls the frame receiver on behalf of both: whichever side polled last,
+    /// a frame arriving wakes both, so neither waits on the other's waker.
+    fanout: Waker,
+}
+
+#[derive(Default)]
+struct Wakers {
+    read: std::sync::Mutex<Option<Waker>>,
+    write: std::sync::Mutex<Option<Waker>>,
+}
+
+impl Wakers {
+    fn set(slot: &std::sync::Mutex<Option<Waker>>, waker: &Waker) {
+        let mut slot = slot.lock().unwrap();
+        if !slot
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    fn wake(slot: &std::sync::Mutex<Option<Waker>>) {
+        let waker = slot.lock().unwrap().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl std::task::Wake for Wakers {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        Self::wake(&self.read);
+        Self::wake(&self.write);
+    }
 }
 
 impl std::fmt::Debug for NetStream {
@@ -608,8 +659,12 @@ impl NetStream {
         window: u64,
         max_credit_ahead: u64,
     ) -> Result<Self> {
+        let wakers = Arc::new(Wakers::default());
+        let fanout = Waker::from(Arc::clone(&wakers));
         let mut stream = Self {
             client,
+            wakers,
+            fanout,
             granted: descriptor.sender_send_credit,
             credit: descriptor.receiver_send_credit,
             max_credit_ahead: max_credit_ahead.max(descriptor.receiver_send_credit),
@@ -626,8 +681,6 @@ impl NetStream {
             write_closed: false,
             failed: None,
             released: false,
-            read_waker: None,
-            write_waker: None,
         };
         // The server may lease less initial credit than asked (its session
         // budget is shared): ask for the whole window now.
@@ -707,18 +760,16 @@ impl NetStream {
     }
 
     fn wake_both(&mut self) {
-        if let Some(waker) = self.read_waker.take() {
-            waker.wake();
-        }
-        if let Some(waker) = self.write_waker.take() {
-            waker.wake();
-        }
+        Wakers::wake(&self.wakers.read);
+        Wakers::wake(&self.wakers.write);
     }
 
-    /// Take every frame that arrived, registering `cx` for the next one.
-    fn pump(&mut self, cx: &mut Context<'_>) {
+    /// Take every frame that arrived, registering both sides for the next.
+    fn pump(&mut self) {
+        let fanout = self.fanout.clone();
+        let mut cx = Context::from_waker(&fanout);
         while self.failed.is_none() {
-            match self.frames.poll_recv(cx) {
+            match self.frames.poll_recv(&mut cx) {
                 Poll::Ready(Some(frame)) => {
                     if let Err(error) = self.handle(frame) {
                         self.fail(error);
@@ -762,9 +813,7 @@ impl NetStream {
                 if !data.data.is_empty() {
                     self.chunks.push_back(data.data);
                 }
-                if let Some(waker) = self.read_waker.take() {
-                    waker.wake();
-                }
+                Wakers::wake(&self.wakers.read);
             }
             yas_wire::transfer::kind::CREDIT => {
                 let credit = Credit::decode(&frame.payload)?;
@@ -777,9 +826,7 @@ impl NetStream {
                     ));
                 }
                 self.credit = credit.cumulative_limit;
-                if let Some(waker) = self.write_waker.take() {
-                    waker.wake();
-                }
+                Wakers::wake(&self.wakers.write);
             }
             yas_wire::transfer::kind::CLOSE => {
                 let close = TransferClose::decode(&frame.payload)?;
@@ -799,9 +846,7 @@ impl NetStream {
                 if self.write_closed {
                     self.release();
                 }
-                if let Some(waker) = self.read_waker.take() {
-                    waker.wake();
-                }
+                Wakers::wake(&self.wakers.read);
             }
             yas_wire::transfer::kind::RESET => {
                 let reset = Reset::decode(&frame.payload)?;
@@ -890,10 +935,11 @@ impl tokio::io::AsyncRead for NetStream {
             if this.read_done {
                 return Poll::Ready(Ok(()));
             }
+            // Register before pumping: a frame arriving in between wakes us.
+            Wakers::set(&this.wakers.read, cx.waker());
             let before = (this.chunks.len(), this.read_done);
-            this.pump(cx);
+            this.pump();
             if (this.chunks.len(), this.read_done) == before && this.failed.is_none() {
-                this.read_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
         }
@@ -945,10 +991,10 @@ impl tokio::io::AsyncWrite for NetStream {
                 this.sent += count as u64;
                 return Poll::Ready(Ok(count));
             }
+            Wakers::set(&this.wakers.write, cx.waker());
             let before = this.credit;
-            this.pump(cx);
+            this.pump();
             if this.credit == before && this.failed.is_none() {
-                this.write_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
         }

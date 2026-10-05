@@ -56253,8 +56253,78 @@ mod tests {
             .map(|metadata| metadata.id)
             .filter(|family_id| *family_id != family::CORE)
             .collect();
-        let (mut client, codec, hello, server_task) =
-            start_registered_session(Arc::new(inner), &every).await;
+        let state = Arc::new(inner);
+        let session = |state: AppState| {
+            let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+            let cancellation = ConnectionCancellation::default();
+            let registration = state
+                .connections
+                .register(cancellation.clone())
+                .expect("test session registers");
+            let task = tokio::spawn(serve_registered(
+                server,
+                Services::from_state(&state),
+                cancellation,
+                Some(registration),
+                None,
+                None,
+                ConnectionOrigin::Network,
+            ));
+            (client, task)
+        };
+        let hello_with = |required: Option<u16>| ClientHello {
+            min_minor: 1,
+            max_minor: 1,
+            receive: ReceiveLimits {
+                max_frame: SERVER_MAX_FRAME,
+                max_decoded: SERVER_MAX_DECODED,
+                max_datagram: 0,
+                max_buffered: TEST_PEER_MAX_BUFFERED,
+            },
+            client_instance: [7; 16],
+            client_name: "yas-server-test".to_owned(),
+            client_release: "1".to_owned(),
+            families: every
+                .iter()
+                .map(|family_id| FamilyOffer {
+                    family_id: *family_id,
+                    versions: vec![1],
+                    required: required == Some(*family_id),
+                })
+                .collect(),
+            codecs: Vec::new(),
+            extensions: Extensions::default(),
+        };
+        async fn hello_result(
+            client: &mut DuplexStream,
+            hello: ClientHello,
+        ) -> (FrameCodec, ResultPrefix) {
+            let frame = Frame {
+                header: FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1),
+                payload: hello.encode().unwrap(),
+            };
+            client.write_all(&yas_wire::PREFACE).await.unwrap();
+            client
+                .write_all(&FrameCodec::pre_hello().encode_stream(&frame).unwrap())
+                .await
+                .unwrap();
+            let codec = FrameCodec::new(FrameLimits::recommended(), []).unwrap();
+            let response = next_frame(client, &codec).await;
+            (codec, ResultPrefix::decode(&response.payload).unwrap())
+        }
+
+        // A client that requires another family is refused at HELLO.
+        let (mut refused, refused_task) = session(state.clone());
+        let (_, prefix) = hello_result(&mut refused, hello_with(Some(family::TERMINAL))).await;
+        assert_eq!(prefix.status, Status::Unsupported);
+        drop(refused);
+        let _ = timeout(TEST_TIMEOUT, refused_task).await.unwrap();
+
+        // One that offers every family gets Core, Transfer and Net.
+        let (mut client, server_task) = session(state);
+        let (codec, prefix) = hello_result(&mut client, hello_with(None)).await;
+        assert_eq!(prefix.status, Status::Ok);
+        let hello = ServerHello::decode(&prefix.body).unwrap();
 
         let offered: Vec<u16> = hello
             .families

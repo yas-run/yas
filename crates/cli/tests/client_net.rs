@@ -195,7 +195,7 @@ async fn failed_opens_say_why() {
         NetFailure::Denied
     );
     assert_eq!(
-        failure(net.open_tcp("localhost", listed).await),
+        failure(net.open_tcp("localhost", listed.wrapping_add(1)).await),
         NetFailure::Denied
     );
     assert_eq!(
