@@ -78,7 +78,6 @@ function effectiveCodecSupport(mask: number): number {
   return mask & _allowedCodecSupport || mask;
 }
 
-/** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
 /** `MouseEvent.buttons` bit of each `MouseEvent.button` value. */
 const MOUSE_BUTTON_MASK: Record<number, number> = {
   0: 1,
@@ -87,6 +86,7 @@ const MOUSE_BUTTON_MASK: Record<number, number> = {
   3: 8,
   4: 16,
 };
+/** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
 const REMOTE_CONTACT_RADIUS = 14;
 
 const REMOTE_CURSOR_ARROW =
