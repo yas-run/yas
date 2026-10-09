@@ -2,8 +2,9 @@
 # GitHub until Forge's phase P4. A tag v* is verified, tested, built for every platform and published.
 #
 # - The tag's signature: GitHub said whether a "verified identity" signed it; here git checks its SSH signature
-#   against the repository variable YAS_TAG_SIGNERS (an allowed_signers file: `pc@rrier.fr ssh-ed25519 AAAA…`).
-#   Without it, or unsigned, the release stops.
+#   against YAS_TAG_SIGNERS (an allowed_signers file: `pc@rrier.fr ssh-ed25519 AAAA…`), a sealed secret only because
+#   admins alone set secrets (Forge has no repository variables yet): for yas-run/yas on refs/tags/v*. Without it, or
+#   unsigned, the release stops.
 # - GitHub Releases go with GitHub: the tarballs, zip and extension modules are kept as this run's artifact
 #   `release-<version>` (P4 gives them a home on Forge).
 # - crates.io takes the sealed secret CARGO_REGISTRY_TOKEN; npm takes NPM_TOKEN (a granular token), both for
@@ -26,11 +27,11 @@ jobs:
           fetch-depth: 0
       - name: Verify the tag's SSH signature
         env:
-          SIGNERS: ${{ vars.YAS_TAG_SIGNERS }}
+          SIGNERS: ${{ secrets.YAS_TAG_SIGNERS }}
         run: |
           tag="$GITHUB_REF_NAME"
           if [ -z "$SIGNERS" ]; then
-            echo "::error::No YAS_TAG_SIGNERS variable: nothing to verify ${tag}'s signature against"
+            echo "::error::No YAS_TAG_SIGNERS secret for this run: nothing to verify ${tag}'s signature against"
             exit 1
           fi
           git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
