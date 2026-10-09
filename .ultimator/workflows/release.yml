@@ -177,7 +177,17 @@ jobs:
 
   release:
     name: Release artifact
-    needs: [lint, test, e2e, coverage, build-packages, build-windows, build-extensions, protocol-fuzz]
+    needs:
+      [
+        lint,
+        test,
+        e2e,
+        coverage,
+        build-packages,
+        build-windows,
+        build-extensions,
+        protocol-fuzz,
+      ]
     runs-on: sandbox
     timeout-minutes: 15
     steps:
