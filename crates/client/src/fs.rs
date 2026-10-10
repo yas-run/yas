@@ -208,6 +208,16 @@ impl Client {
             .and_then(|limits| wire::Limits::from_extensions(&limits).ok())
             .map_or(0, |limits| limits.capabilities)
     }
+
+    /// The most content one inline FS write carries on this server (`MAX_INLINE_BYTES`, as it
+    /// advertises it): 0 before the FS family is negotiated.
+    fn fs_inline_bytes(&self) -> usize {
+        self.family_limits(family::FS)
+            .and_then(|limits| wire::Limits::from_extensions(&limits).ok())
+            .map_or(0, |limits| {
+                (limits.max_inline_bytes as usize).min(wire::MAX_INLINE_BYTES)
+            })
+    }
 }
 
 /// File content read by [`FsRoot::read`] and friends.
@@ -797,6 +807,7 @@ impl FsRoot {
                     create_parents: options.create_parents,
                     mode: options.mode,
                     content: content.to_vec(),
+                    in_place: false,
                 })
                 .await;
         }
@@ -819,22 +830,55 @@ impl FsRoot {
         .await
     }
 
-    /// Write a whole file as `open(2)` with `O_WRONLY|O_CREAT|O_TRUNC` and `write(2)` would
-    /// (`STAGE_IN_PLACE`), as Node's `writeFile` does: through a final symlink, an existing
-    /// file keeping its inode, owner and mode, a new one mode 0666 less the server's umask. Not
-    /// atomic: a failure can leave the file truncated. Needs `CAPABILITY_STAGE_IN_PLACE`; a
-    /// failure carries its [`os_error`].
+    /// Write a whole file as `open(2)` with `O_WRONLY|O_CREAT|O_TRUNC` and `write(2)` would,
+    /// as Node's `writeFile` does: through a final symlink, an existing file keeping its inode,
+    /// owner and mode, a new one mode 0666 less the server's umask. Not atomic: a failure can
+    /// leave the file truncated. Content up to the server's inline limit goes in one `APPLY`
+    /// (one round trip) where it offers `CAPABILITY_APPLY_IN_PLACE`; other content is staged
+    /// (`STAGE_IN_PLACE`, needing `CAPABILITY_STAGE_IN_PLACE`; two round trips). A failure
+    /// carries its [`os_error`] either way.
     pub async fn write_in_place(&self, path: &str, content: &[u8]) -> Result<Written> {
+        self.write_in_place_if(path, content, Precondition::Any)
+            .await
+    }
+
+    /// [`write_in_place`](Self::write_in_place), only while the entry at `path` matches
+    /// `precondition`, which the server checks and writes under its mutation lock:
+    /// [`Precondition::Hash`] of what was read makes a read, change and write a compare-and-swap
+    /// on content. The entry checked is the one at `path` itself (a final symlink's own, not its
+    /// target's), so name the file a link resolves to. A failed precondition is an
+    /// [`Error::Status`] with status `CONFLICT` and no [`os_error`]; [`conflict_detail`]
+    /// describes the current entry.
+    pub async fn write_in_place_if(
+        &self,
+        path: &str,
+        content: &[u8],
+        precondition: Precondition,
+    ) -> Result<Written> {
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::invalid(format!(
                 "file is {} bytes; the YAS limit is {MAX_FILE_BYTES}",
                 content.len()
             )));
         }
+        if content.len() <= self.client.fs_inline_bytes()
+            && self.client.fs_capabilities() & schema::CAPABILITY_APPLY_IN_PLACE as u32 != 0
+        {
+            return self
+                .apply_one(ApplyItem::WriteInline {
+                    path: wire_path(path)?,
+                    precondition,
+                    create_parents: false,
+                    mode: 0,
+                    content: content.to_vec(),
+                    in_place: true,
+                })
+                .await;
+        }
         self.stage_and_commit(
             wire_path(path)?,
             content,
-            Precondition::Any,
+            precondition,
             schema::STAGE_IN_PLACE as u16,
             0,
             0,

@@ -3,7 +3,8 @@
 //! `yas-client` connects to a YAS server (the same way the `yas` CLI does)
 //! and drives its families from async Rust: non-PTY [processes](process),
 //! [files](fs), the [key-value store](kv) and environment,
-//! [terminals](terminal) and GUI [surfaces](surface). On Unix it can also
+//! [terminals](terminal), GUI [surfaces](surface), and TCP/UDP flows the
+//! server opens for it ([net]). On Unix it can also
 //! [host] a private server as a child process, reachable through the
 //! connections it hands out.
 //!
@@ -64,6 +65,7 @@ pub mod fs;
 pub mod host;
 pub mod kv;
 pub mod native;
+pub mod net;
 pub mod process;
 pub mod state;
 pub mod surface;
@@ -75,6 +77,9 @@ pub use client::{Client, DEFAULT_REQUEST_TIMEOUT};
 pub use error::{Error, Result, format_result_detail};
 pub use options::{ConnectOptions, HelloOptions, read_only_extension};
 
+/// The producer side of YAS uplinks (`yas uplink`): publish a YAS server
+/// through a relay, over WebTransport or WebSockets.
+pub use yas_proxy::uplink_producer;
 /// The wire codecs this crate speaks (`yas-wire`), for the escape hatches
 /// ([`Client::request`], [`Client::request_raw`]).
 pub use yas_wire as wire;

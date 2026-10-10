@@ -1,5 +1,6 @@
 //! Connection and HELLO options.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use yas_wire::{Extension, Extensions, core::FamilyOffer, family};
@@ -24,6 +25,25 @@ pub struct HelloOptions {
     /// HELLO extension, so a server that does not understand it refuses the
     /// session instead of silently granting full control.
     pub read_only: bool,
+    /// Any text to tell this client apart by in the server's client list
+    /// (`yas client list`): a person, a device, the app embedding it. That
+    /// list shows each client's Terminal and Surface views, so this is what
+    /// says who a view's size came from. The server passes it on as is: being
+    /// a `String`, it is UTF-8, and it must take at most
+    /// [`MAX_CLIENT_IDENTIFIER_BYTES`](yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES)
+    /// (1 KiB), the only things asked of it; several clients may report the
+    /// same one. `None`
+    /// reports none. [`Client::set_identifier`](crate::Client::set_identifier)
+    /// replaces it later.
+    pub identifier: Option<String>,
+    /// How many bytes the server may have on their way to this client at once
+    /// (HELLO's `max_buffered`): every Transfer and State window the session
+    /// grants comes out of it, and [`crate::Client::default_process_window`]
+    /// sizes process output windows so that all of them fit in it. Each open
+    /// stream holds its window whether or not it is writing, so a client that
+    /// runs many processes at once and wants wide windows raises it. It bounds
+    /// what may wait here unread, not what is allocated. 16 MiB by default.
+    pub receive_budget: u64,
 }
 
 impl Default for HelloOptions {
@@ -34,6 +54,8 @@ impl Default for HelloOptions {
             families: None,
             required: Vec::new(),
             read_only: false,
+            identifier: None,
+            receive_budget: yas_wire::schema::transport::RECOMMENDED_BUFFERED,
         }
     }
 }
@@ -62,6 +84,19 @@ impl HelloOptions {
     /// Ask for a read-only session.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Report `identifier` as this client's identifier.
+    pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
+        self.identifier = Some(identifier.into());
+        self
+    }
+
+    /// Set [`HelloOptions::receive_budget`], at least 1 byte and at most
+    /// 1 GiB (the protocol's hard maximum).
+    pub fn receive_budget(mut self, bytes: u64) -> Self {
+        self.receive_budget = bytes.clamp(1, yas_wire::schema::transport::HARD_MAX_BUFFERED);
         self
     }
 
@@ -94,6 +129,13 @@ impl HelloOptions {
         if self.read_only {
             extensions.push(read_only_extension());
         }
+        if let Some(identifier) = &self.identifier {
+            extensions.push(
+                yas_wire::core::client_identifier_extension(identifier).map_err(|error| {
+                    Error::invalid(format!("invalid client identifier: {error}"))
+                })?,
+            );
+        }
         extensions.sort_by_key(|extension| extension.tag);
         Ok(Extensions(extensions))
     }
@@ -123,6 +165,11 @@ pub struct ConnectOptions {
     /// The `yas` executable, used to auto-start local servers and the proxy
     /// daemon. `None` (the default) never starts anything.
     pub executable: Option<PathBuf>,
+    /// What [`ConnectOptions::executable`] takes before a subcommand of the
+    /// yas CLI's (`server`, `proxy-daemon`): none for `yas` itself; `["yas"]`
+    /// for a program that carries the yas CLI as a subcommand of its own
+    /// (`ultimator yas …`).
+    pub executable_args: Vec<OsString>,
     /// Start `local` / `local:NAME` servers that are not running (needs
     /// [`ConnectOptions::executable`]).
     pub start_local: bool,
@@ -144,6 +191,7 @@ impl Default for ConnectOptions {
             hub: yas_webrtc_forwarder::DEFAULT_HUB_URL.into(),
             proxy: false,
             executable: None,
+            executable_args: Vec::new(),
             start_local: false,
             remotes: true,
             ssh: None,
