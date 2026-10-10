@@ -1,0 +1,41 @@
+# YAS's release tarballs for one platform (bin/build-tarballs, through the flake), and on macOS the complete
+# cross-platform product graph's tests, as .github/workflows/_build-packages.yml did.
+name: packages
+description: Build the release tarballs into dist/
+inputs:
+  label:
+    description: linux-x86_64, linux-aarch64 or macos-aarch64
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.ultimator/actions/nix
+    - name: Build release tarballs
+      shell: bash
+      env:
+        # Bound aggregate Cargo parallelism to the machine's memory: the arm64 machine serializes its Nix jobs.
+        NIX_CONFIG: |
+          experimental-features = nix-command flakes
+          max-jobs = ${{ inputs.label == 'linux-aarch64' && '1' || '2' }}
+          cores = ${{ inputs.label == 'linux-aarch64' && '2' || '4' }}
+      run: ./bin/build-tarballs dist
+    - name: Test the complete cross-platform YAS product graph on macOS
+      if: inputs.label == 'macos-aarch64'
+      shell: bash
+      env:
+        RUSTFLAGS: "-D warnings"
+      run: |
+        # Linux-only compositor probes are Cargo examples. Exercise every workspace library, product binary, and
+        # integration/unit test here without asking macOS to compile those live Wayland probes.
+        nix develop --command bash -lc '
+          cd crates/browser &&
+          wasm-pack build --target web --release --out-dir pkg &&
+          cd ../../js &&
+          pnpm install --frozen-lockfile &&
+          pnpm --filter @yas-run/core run build &&
+          pnpm --filter @yas-run/solid run build &&
+          pnpm --filter @yas-run/ui run build &&
+          pnpm --filter yas-web run build
+        '
+        nix develop --command cargo test --workspace --lib --bins --tests
+        nix develop --command bash -lc 'cd js && pnpm install --frozen-lockfile && pnpm run typecheck && pnpm run test'

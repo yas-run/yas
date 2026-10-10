@@ -122,7 +122,7 @@ pub(super) fn accumulate_write_duration(counter: &AtomicU64, elapsed: Duration) 
     if elapsed_us == 0 {
         return;
     }
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(elapsed_us))
     });
 }
@@ -1110,6 +1110,8 @@ struct Services {
     channel_enabled: bool,
     net_enabled: bool,
     net_policy: super::net::Policy,
+    /// `--net-only`: HELLO selects Core, Transfer and Net alone.
+    net_only: bool,
     events: Option<super::yas_events::Runtime>,
     fs: Option<super::yas_fs::Runtime>,
     git: Option<super::yas_git_adapter::Runtime>,
@@ -1170,7 +1172,9 @@ impl Services {
             net_policy: super::net::Policy::new(
                 state.config.allow_forward_insecure,
                 &state.config.allow_forward,
+                state.config.allow_forward_strict || state.config.net_only,
             ),
+            net_only: state.config.net_only,
             events: Some(super::yas_events::Runtime::new(state.events.clone())),
             fs: Some(super::yas_fs::Runtime::new(state.clone())),
             git: Some(super::yas_git_adapter::Runtime::new(state.clone())),
@@ -1240,6 +1244,10 @@ impl Services {
                     )
                 }
             })
+            // Windows keeps each drive's current directory in the block as `=C:=C:\…`, which
+            // std lists as a variable named `=C:`: no ENV entry can carry a name with `=`, and
+            // one such entry would fail the whole snapshot.
+            .filter(|(key, _)| !key.is_empty() && !key.contains(&b'=') && !key.contains(&0))
             .collect::<BTreeMap<_, _>>();
         // This is the effective configured identity, not merely the value the
         // parent process happened to export before configuration was loaded.
@@ -2034,6 +2042,11 @@ async fn serve_registered<S>(
         client_instance: hello.client_instance,
         name: hello.client_name.clone(),
         release: hello.client_release.clone(),
+        // ClientHello::decode has refused a non-UTF-8 identifier already.
+        identifier: yas_wire::core::client_identifier(&hello.extensions)
+            .ok()
+            .flatten()
+            .map(str::to_owned),
     };
     // An embedded extension attempt is what it is regardless of the socket it
     // came in on; everything else is described by its transport.
@@ -2971,10 +2984,12 @@ enum Internal {
     },
     ProcessExited {
         attachment_id: u32,
+        report: Option<(u64, super::yas_process::ExitInfo)>,
     },
     ProcessOutputClosed {
         attachment_id: u32,
         transfer_id: u32,
+        final_data_bytes: u64,
         status: Status,
         detail: String,
     },
@@ -3043,6 +3058,8 @@ enum ProcessOperationOutcome {
         fingerprint: [u8; 32],
         stdout_receive_credit: u64,
         stderr_receive_credit: u64,
+        /// SPAWN_REPORT_EXIT: send the exit to this session as an EXIT event.
+        report_exit: bool,
         outcome: Result<super::yas_process::Attachment, super::yas_process::Error>,
     },
     Attach {
@@ -5296,6 +5313,14 @@ async fn client_catalogue_snapshot(
         }
         .extension()
         .expect("fixed Client bandwidth window is valid");
+        let mut extensions = vec![rates];
+        if let Some(identifier) = client
+            .native_identity
+            .as_ref()
+            .and_then(|identity| identity.identifier.as_deref())
+        {
+            extensions.push(yas_client::identifier_extension(identifier));
+        }
         records.insert(
             session_id,
             yas_client::ClientRecord {
@@ -5309,7 +5334,7 @@ async fn client_catalogue_snapshot(
                 release,
                 label: client.origin.label().to_owned(),
                 origin: typed_client_origin(&client.origin),
-                extensions: Extensions(vec![rates]),
+                extensions: Extensions(extensions),
             },
         );
     }
@@ -5338,6 +5363,10 @@ async fn client_catalogue_snapshot(
                     .extension()
                     .expect("validated native Client watch timings"),
             );
+        }
+        // Tag 5 sorts after the subscription extensions above.
+        if let Some(identifier) = &client.identity.identifier {
+            subscription_extensions.push(yas_client::identifier_extension(identifier));
         }
         let extensions = Extensions(subscription_extensions);
         records.insert(
@@ -7467,9 +7496,10 @@ impl Session {
                     .await;
             }
         };
-        let (Some(state), Some(coordinator)) = (
+        let (Some(state), Some(coordinator), false) = (
             self.services.app_state.clone(),
             self.services.shutdown.clone(),
+            self.services.net_only,
         ) else {
             return self
                 .send_sensitive_result(&frame, Status::Unavailable, Vec::new())
@@ -8062,10 +8092,21 @@ impl Session {
                             return self.send_result(&frame, Status::Invalid, Vec::new()).await;
                         }
                     };
-                    if has_unknown_required(&extensions, &[]) {
+                    if has_unknown_required(&extensions, &[CLIENT_IDENTIFIER_EXTENSION]) {
                         return self
                             .send_result(&frame, Status::Unsupported, Vec::new())
                             .await;
+                    }
+                    match yas_wire::core::client_identifier(&extensions) {
+                        Ok(Some(identifier)) => {
+                            self.replace_client_identifier(identifier.to_owned()).await;
+                        }
+                        Ok(None) => {}
+                        // Not UTF-8, or longer than MAX_CLIENT_IDENTIFIER_BYTES:
+                        // the only two rules an identifier has.
+                        Err(_) => {
+                            return self.send_result(&frame, Status::Invalid, Vec::new()).await;
+                        }
                     }
                     self.send_result(&frame, Status::Ok, Vec::new()).await
                 }
@@ -8947,7 +8988,16 @@ impl Session {
         let name = format!("yas-app-{instance_id}");
         let path = runtime_dir.join(&name);
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).map_err(|_| Status::Io)?;
+        let listener = UnixListener::bind(&path).map_err(|error| {
+            // The client only sees Io; say which socket, and why (a runtime
+            // directory too long for a socket path, typically).
+            eprintln!(
+                "[surface] cannot bind the app socket {} ({} bytes): {error}",
+                path.display(),
+                path.as_os_str().len()
+            );
+            Status::Io
+        })?;
         let (reply, applied) = std::sync::mpsc::sync_channel(1);
         let submission = submit_app_socket_add_command(
             command_sender,
@@ -9736,16 +9786,19 @@ impl Session {
                     .max_by_key(|(_, pixels)| u64::from(pixels.width) * u64::from(pixels.height))
                     .map(|(_, pixels)| (pixels.width, pixels.height, pixels.pixels.clone()))
             });
-            let command_tx = shared
-                .compositor
-                .as_ref()
-                .map(|compositor| compositor.handle.command_tx.clone());
+            let command_tx = shared.compositor.as_ref().map(|compositor| {
+                (
+                    compositor.handle.command_tx.clone(),
+                    compositor.handle.command_sender(),
+                )
+            });
             (snapshot, command_tx)
         };
         let mut captured = match command_tx {
-            Some(command_tx) => {
+            Some((command_tx, loop_waker)) => {
                 super::request_surface_capture_with_timeout(
                     command_tx,
+                    move || loop_waker.wake(),
                     surface_id,
                     0,
                     Duration::from_secs(5),
@@ -14115,12 +14168,16 @@ impl Session {
             }
             yas_wire::schema::terminal::event::INPUT => {
                 let value = yas_terminal::Input::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 self.write_terminal_input(pty_id, &value.data).await
             }
             yas_wire::schema::terminal::event::MOUSE => {
                 let value = yas_terminal::Mouse::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 let column = u16::try_from(value.column).map_err(|_| ())?;
                 let row = u16::try_from(value.row).map_err(|_| ())?;
                 self.write_terminal_mouse(
@@ -14135,7 +14192,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL => {
                 let value = yas_terminal::Wheel::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14144,7 +14203,9 @@ impl Session {
             }
             yas_wire::schema::terminal::event::WHEEL_AT => {
                 let value = yas_terminal::WheelAt::decode(&frame.payload).map_err(|_| ())?;
-                let pty_id = self.update_terminal_feedback(&value.feedback).await?;
+                let Some(pty_id) = self.update_terminal_feedback(&value.feedback).await? else {
+                    return Ok(());
+                };
                 if value.dx_32_32 != 0 || value.dy_32_32 == 0 {
                     return Err(());
                 }
@@ -14165,13 +14226,15 @@ impl Session {
     async fn update_terminal_feedback(
         &mut self,
         feedback: &yas_terminal::ViewFeedback,
-    ) -> Result<u16, ()> {
+    ) -> Result<Option<u16>, ()> {
         self.settle_completed_terminal_frame(feedback.view_id, true)
             .await?;
         let (state, pty_id, backend_view, owed_final_guard) = {
             let terminal = self.native.as_mut().ok_or(())?;
             let state = terminal.state.clone();
-            let view = terminal.views.get_mut(&feedback.view_id).ok_or(())?;
+            let Some(view) = terminal.views.get_mut(&feedback.view_id) else {
+                return Ok(None);
+            };
             let credit_opened = apply_terminal_feedback(view, feedback)?;
             let owed_final_guard = (credit_opened && view.frame_owed).then(|| {
                 view.frame_owed = false;
@@ -14190,7 +14253,7 @@ impl Session {
             view.frame_owed = true;
             view.frame_owed_final_guard = owed_final_guard;
         }
-        Ok(pty_id)
+        Ok(Some(pty_id))
     }
 
     async fn rearm_terminal_view(
@@ -18220,6 +18283,7 @@ impl Session {
         let operation_id = request.operation_id;
         let stdout_receive_credit = request.stdout_receive_credit;
         let stderr_receive_credit = request.stderr_receive_credit;
+        let report_exit = request.flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u16 != 0;
         let session = self.process.as_ref().ok_or(())?.session.clone();
         let internal = self.internal.clone();
         let cancellation = self.cancellation.clone();
@@ -18237,6 +18301,7 @@ impl Session {
                         fingerprint,
                         stdout_receive_credit,
                         stderr_receive_credit,
+                        report_exit,
                         outcome,
                     },
                     _slot: None,
@@ -24902,7 +24967,10 @@ impl Session {
                 self.handle_process_stdin_progress(attachment_id, consumed_lifetime_offset, open)
                     .await?;
             }
-            Internal::ProcessExited { attachment_id } => {
+            Internal::ProcessExited {
+                attachment_id,
+                report,
+            } => {
                 if let Some(attachment) = self
                     .process
                     .as_mut()
@@ -24919,15 +24987,25 @@ impl Session {
                     }
                 }
                 self.maybe_remove_process_attachment(attachment_id);
+                if let Some((process_handle, exit)) = report {
+                    send_exit_report(&self.out, process_handle, exit, &self.cancellation).await;
+                }
             }
             Internal::ProcessOutputClosed {
                 attachment_id,
                 transfer_id,
+                final_data_bytes,
                 status,
                 detail,
             } => {
-                self.finish_process_output(attachment_id, transfer_id, status, &detail)
-                    .await?;
+                self.finish_process_output(
+                    attachment_id,
+                    transfer_id,
+                    final_data_bytes,
+                    status,
+                    &detail,
+                )
+                .await?;
             }
             Internal::ProcessFailed {
                 attachment_id,
@@ -25394,6 +25472,7 @@ impl Session {
                 fingerprint,
                 stdout_receive_credit,
                 stderr_receive_credit,
+                report_exit,
                 outcome,
             } => {
                 if kind != yas_process_wire::request_kind::SPAWN {
@@ -25451,6 +25530,7 @@ impl Session {
                     }
                 };
                 let body = bundle.encode().map_err(|_| ())?;
+                let report_exit = report_exit.then_some(bundle.process_handle);
                 self.record_process_replay(
                     operation_id,
                     kind,
@@ -25474,7 +25554,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, report_exit)?;
                 Ok(())
             }
             ProcessOperationOutcome::Attach {
@@ -25535,7 +25615,7 @@ impl Session {
                     self.remove_process_attachment(attachment_id, true);
                     return Err(());
                 }
-                self.activate_process_attachment(attachment_id, events)?;
+                self.activate_process_attachment(attachment_id, events, None)?;
                 Ok(())
             }
             ProcessOperationOutcome::Control {
@@ -25810,10 +25890,13 @@ impl Session {
         ))
     }
 
+    /// Start forwarding an installed attachment's streams; with `report_exit` (the handle of a
+    /// process spawned with SPAWN_REPORT_EXIT), its exit is sent as an EXIT event too.
     fn activate_process_attachment(
         &mut self,
         attachment_id: u32,
         events: super::yas_process::AttachmentEvents,
+        report_exit: Option<u64>,
     ) -> Result<(), ()> {
         let attachment = self
             .process
@@ -25837,6 +25920,7 @@ impl Session {
             attachment.stdout_transfer,
             stdout_flow,
             attachment.stderr_transfer.zip(stderr_flow),
+            report_exit,
             self.out.clone(),
             self.internal.clone(),
             self.cancellation.clone(),
@@ -25963,6 +26047,7 @@ impl Session {
         &mut self,
         attachment_id: u32,
         transfer_id: u32,
+        final_data_bytes: u64,
         status: Status,
         detail: &str,
     ) -> Result<(), ()> {
@@ -26002,8 +26087,23 @@ impl Session {
                 ProcessTransferKind::Stdin => unreachable!(),
             }
         }
+        // Admission and replay bookkeeping belong to this connection task. Retire them
+        // before CLOSE can let the peer release its permit and send a replacement SPAWN.
         self.maybe_remove_process_attachment(attachment_id);
-        Ok(())
+        send_event_with_sensitivity(
+            &self.out,
+            family::TRANSFER,
+            yas_wire::schema::transfer::event::CLOSE,
+            &Close {
+                transfer_id,
+                final_data_bytes,
+                status: Status::Ok.code(),
+                detail: Vec::new(),
+            },
+            &self.cancellation,
+            true,
+        )
+        .await
     }
 
     async fn fail_process_attachment(
@@ -26092,6 +26192,8 @@ impl Session {
                 self.outbound_sensitive.remove(&transfer_id);
             }
         }
+        // A SPAWN_REPORT_EXIT process whose attachment goes before its exit reports none: the
+        // client knows (it dropped a stream, detached, or saw its streams reset) and WAITs.
         if detach {
             tokio::spawn(async move {
                 let _ = attachment.control.detach().await;
@@ -27180,6 +27282,22 @@ impl Session {
                 }
             }
             Ok(changed)
+        }
+    }
+
+    /// Replace what this session reported as its identifier. Client catalogue
+    /// watchers pick it up at their next refresh, as they do any other change
+    /// to the record.
+    async fn replace_client_identifier(&mut self, identifier: String) {
+        let Some(state) = self.native.as_ref().map(|native| native.state.clone()) else {
+            return;
+        };
+        let mut shared = state.session.lock().await;
+        if let Some(client) = shared
+            .native_yas_clients
+            .get_mut(&self.negotiated.session_id)
+        {
+            client.identity.identifier = Some(identifier);
         }
     }
 
@@ -28845,7 +28963,10 @@ fn negotiate(
     }
     const READ_ONLY_SESSION_EXTENSION: u16 =
         yas_wire::schema::core::CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION as u16;
-    if has_unknown_required(&hello.extensions, &[READ_ONLY_SESSION_EXTENSION]) {
+    if has_unknown_required(
+        &hello.extensions,
+        &[READ_ONLY_SESSION_EXTENSION, CLIENT_IDENTIFIER_EXTENSION],
+    ) {
         return Err(Status::Unsupported);
     }
     let read_only = hello
@@ -28862,6 +28983,7 @@ fn negotiate(
             required.insert(offer.family_id);
         }
         let supported = (!read_only || read_only_family_allowed(offer.family_id))
+            && (!services.net_only || net_only_family_allowed(offer.family_id))
             && offer.versions.contains(&1)
             && match offer.family_id {
                 family::TRANSFER => true,
@@ -29012,11 +29134,14 @@ fn family_descriptors(
         sends_event(yas_wire::core::event_kind::FAMILY_UPDATE),
     ];
     if services.shutdown.is_some() {
-        core_operations.push(advertised_operation(
-            family::CORE,
-            Class::Request,
-            yas_wire::core::request_kind::SHUTDOWN,
-        ));
+        // A net-only server's lifetime is its operator's, never a client's.
+        if !services.net_only {
+            core_operations.push(advertised_operation(
+                family::CORE,
+                Class::Request,
+                yas_wire::core::request_kind::SHUTDOWN,
+            ));
+        }
         core_operations.push(advertised_operation(
             family::CORE,
             Class::Event,
@@ -30118,6 +30243,12 @@ fn family_descriptors(
     descriptors
 }
 
+/// What a `--net-only` server offers beside Core: Net, and the Transfer
+/// streams its TCP flows ride on.
+const fn net_only_family_allowed(family_id: u16) -> bool {
+    matches!(family_id, family::TRANSFER | family::NET)
+}
+
 const fn read_only_family_allowed(family_id: u16) -> bool {
     matches!(
         family_id,
@@ -31007,6 +31138,36 @@ struct ProcessOutputChunk {
     data: Vec<u8>,
 }
 
+/// A SPAWN_REPORT_EXIT process's exit, as the EXIT event its session gets unasked.
+async fn send_exit_report(
+    out: &FrameSender,
+    process_handle: u64,
+    exit: super::yas_process::ExitInfo,
+    connection: &ConnectionCancellation,
+) {
+    // KEEP_OUTPUT: what was dropped of each stream.
+    let elided = exit
+        .elided
+        .iter()
+        .zip([false, true])
+        .filter_map(|(elided, stderr)| elided.map(|elided| elided.extension(stderr)))
+        .collect();
+    let report = yas_process_wire::ExitReport {
+        process_handle,
+        exit: exit.into_record(monotonic_ns()),
+        extensions: Extensions(elided),
+    };
+    let _ = send_event_with_sensitivity(
+        out,
+        family::PROCESS,
+        yas_process_wire::event_kind::EXIT,
+        &report,
+        connection,
+        true,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_process_attachment(
     attachment_id: u32,
@@ -31016,6 +31177,7 @@ fn spawn_process_attachment(
     stdout_transfer: u32,
     stdout_flow: Arc<FlowControl>,
     stderr: Option<(u32, Arc<FlowControl>)>,
+    report_exit: Option<u64>,
     out: FrameSender,
     internal: mpsc::Sender<Internal>,
     connection: ConnectionCancellation,
@@ -31117,14 +31279,36 @@ fn spawn_process_attachment(
                         return;
                     }
                 }
-                Some(super::yas_process::Event::Exit(_)) => {
+                Some(super::yas_process::Event::Exit(exit)) => {
                     exited = true;
+                    // Queue exit bookkeeping before dropping the output senders: every final
+                    // CLOSE is then handled after exited=true. The connection publishes the
+                    // report after bookkeeping, independent of this task being retired.
                     let _ = internal
-                        .send(Internal::ProcessExited { attachment_id })
+                        .send(Internal::ProcessExited {
+                            attachment_id,
+                            report: report_exit.map(|handle| (handle, exit)),
+                        })
                         .await;
                     break;
                 }
-                None => break,
+                None => {
+                    // The route failed (its output fell a window behind): the session resets
+                    // this attachment's Transfers with why, rather than end them cleanly
+                    // short, and cancels this task and its streams meanwhile.
+                    if let Some(detail) = events.failure() {
+                        let _ = internal
+                            .send(Internal::ProcessFailed {
+                                attachment_id,
+                                status: Status::ResourceExhausted,
+                                detail,
+                            })
+                            .await;
+                        cancellation.cancelled().await;
+                        return;
+                    }
+                    break;
+                }
             }
         }
         drop(stdout_tx);
@@ -31218,25 +31402,8 @@ async fn run_process_output(
                 offset = end;
             }
         }
-        // Linearize stream-bundle retirement before CLOSE becomes observable.
-        // The connection task may otherwise service a duplicate SPAWN while
-        // ProcessOutputClosed is still waiting in its independent queue.
+        // The connection task owns final CLOSE publication and admission retirement.
         stream_bundle_replayable.store(false, Ordering::Release);
-        send_event_with_sensitivity(
-            &out,
-            family::TRANSFER,
-            yas_wire::schema::transfer::event::CLOSE,
-            &Close {
-                transfer_id,
-                final_data_bytes: offset,
-                status: Status::Ok.code(),
-                detail: Vec::new(),
-            },
-            &connection,
-            true,
-        )
-        .await
-        .map_err(|_| (Status::Internal, "Process output close failed".to_owned()))?;
         Ok::<_, (Status, String)>(())
     };
     let result = tokio::select! {
@@ -31253,6 +31420,7 @@ async fn run_process_output(
         .send(Internal::ProcessOutputClosed {
             attachment_id,
             transfer_id,
+            final_data_bytes: offset,
             status,
             detail,
         })
@@ -33124,6 +33292,7 @@ async fn send_event_confirmed_with_sensitivity<T: Encode>(
 fn net_connect_status(error: super::net::NativeConnectError) -> Status {
     match error {
         super::net::NativeConnectError::Permission => Status::Unavailable,
+        super::net::NativeConnectError::Timeout => Status::Timeout,
         super::net::NativeConnectError::NotFound(_detail) => Status::NotFound,
         super::net::NativeConnectError::Refused(_detail)
         | super::net::NativeConnectError::Io(_detail) => Status::Io,
@@ -34676,7 +34845,7 @@ static NEXT_PRESENTATION_HANDLE: AtomicU64 = AtomicU64::new(1 << 32);
 #[cfg(target_os = "linux")]
 fn alloc_presentation_handle() -> Option<u64> {
     NEXT_PRESENTATION_HANDLE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .ok()
@@ -35307,6 +35476,10 @@ fn has_unknown_required(extensions: &Extensions, supported: &[u16]) -> bool {
         .iter()
         .any(|extension| extension.required && !supported.contains(&extension.tag))
 }
+
+/// The HELLO and CLIENT_UPDATE extension carrying a client's own identifier.
+const CLIENT_IDENTIFIER_EXTENSION: u16 =
+    yas_wire::schema::core::CLIENT_HELLO_IDENTIFIER_EXTENSION as u16;
 
 const fn channel_status(error: ChannelError) -> Status {
     match error {
@@ -36098,7 +36271,7 @@ async fn run_terminal_watch(
     {
         return;
     }
-    let mut revision = initial.revision;
+    let mut previous = initial;
     loop {
         tokio::select! {
             changed = updates.changed() => {
@@ -36108,50 +36281,96 @@ async fn run_terminal_watch(
             }
             _ = cancellation.cancelled() => return,
         }
-        let snapshot = updates.borrow_and_update().clone();
-        if snapshot.revision <= revision {
+        let current = updates.borrow_and_update().clone();
+        if current.revision <= previous.revision {
             continue;
         }
-        let reset = StateEvent {
-            subscription_id,
-            phase: Phase::Reset,
-            flags: 0,
-            from_revision: revision,
-            to_revision: snapshot.revision,
-            records: Vec::new(),
+        let Ok(event) = terminal_delta_event(subscription_id, &previous, &current) else {
+            return;
         };
-        if send_bounded_state_event_with_sensitivity(
-            family::TERMINAL,
-            yas_wire::schema::terminal::event::STATE,
-            &reset,
-            event_limit,
-            &mut sent_bytes,
-            &control,
-            &out,
-            &cancellation,
-            false,
-        )
-        .await
-        .is_err()
-        {
+        let result = if let Some(reset) = state_delta_reset(&event, event_limit) {
+            if send_bounded_state_event_with_sensitivity(
+                family::TERMINAL,
+                yas_wire::schema::terminal::event::STATE,
+                &reset,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+                false,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            send_terminal_snapshot(
+                subscription_id,
+                &current,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+            )
+            .await
+        } else {
+            send_bounded_state_event_with_sensitivity(
+                family::TERMINAL,
+                yas_wire::schema::terminal::event::STATE,
+                &event,
+                event_limit,
+                &mut sent_bytes,
+                &control,
+                &out,
+                &cancellation,
+                false,
+            )
+            .await
+        };
+        if result.is_err() {
             return;
         }
-        if send_terminal_snapshot(
-            subscription_id,
-            &snapshot,
-            event_limit,
-            &mut sent_bytes,
-            &control,
-            &out,
-            &cancellation,
-        )
-        .await
-        .is_err()
-        {
-            return;
-        }
-        revision = snapshot.revision;
+        previous = current;
     }
+}
+
+fn terminal_delta_event(
+    subscription_id: u32,
+    previous: &TerminalCatalogue,
+    current: &TerminalCatalogue,
+) -> Result<StateEvent, ()> {
+    let handles = previous
+        .records
+        .keys()
+        .chain(current.records.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut records = Vec::new();
+    for terminal_handle in handles {
+        let record = match (
+            previous.records.get(&terminal_handle),
+            current.records.get(&terminal_handle),
+        ) {
+            (None, Some(record)) => record.state_record(RecordKind::Add),
+            (Some(_), None) => yas_terminal::RemovedTerminal { terminal_handle }.state_record(),
+            (Some(previous), Some(current)) if previous != current => {
+                current.state_record(RecordKind::Replace)
+            }
+            _ => continue,
+        }
+        .map_err(|_| ())?;
+        records.push(record);
+    }
+    Ok(StateEvent {
+        subscription_id,
+        phase: Phase::Delta,
+        flags: 0,
+        from_revision: previous.revision,
+        to_revision: current.revision,
+        records,
+    })
 }
 
 fn client_delta_event(
@@ -37386,6 +37605,8 @@ mod tests {
 
     mod aggregate_receive_qualification;
     mod peer_liveness;
+    #[cfg(unix)]
+    mod process_completion;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_PEER_MAX_BUFFERED: u64 = 32 * 1024 * 1024;
@@ -39423,6 +39644,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_catalogue_revision_is_one_delta_with_only_changed_records() {
+        let terminal = |terminal_handle| yas_terminal::TerminalRecord {
+            terminal_handle,
+            lifecycle: yas_terminal::Lifecycle::Running,
+            rows: 24,
+            cols: 80,
+            generation: 1,
+            used_rows: 0,
+            extensions: Extensions::default(),
+        };
+        let (unchanged, changed, removed, added) =
+            (terminal(1), terminal(2), terminal(3), terminal(4));
+        let previous = TerminalCatalogue {
+            revision: 40,
+            records: HashMap::from([(1, unchanged.clone()), (2, changed.clone()), (3, removed)]),
+        };
+        let mut exited = changed;
+        exited.lifecycle = yas_terminal::Lifecycle::Exited;
+        let current = TerminalCatalogue {
+            revision: 42,
+            records: HashMap::from([(1, unchanged), (2, exited.clone()), (4, added.clone())]),
+        };
+
+        let delta = terminal_delta_event(7, &previous, &current).unwrap();
+
+        assert_eq!(delta.subscription_id, 7);
+        assert_eq!(delta.phase, Phase::Delta);
+        assert_eq!(delta.from_revision, 40);
+        assert_eq!(delta.to_revision, 42);
+        assert_eq!(delta.records.len(), 3);
+        assert_eq!(delta.records[0].kind, RecordKind::Replace);
+        assert_eq!(
+            yas_terminal::terminal_from_state_record(&delta.records[0]).unwrap(),
+            exited,
+        );
+        assert_eq!(delta.records[1].kind, RecordKind::Remove);
+        assert_eq!(
+            yas_terminal::removal_from_state_record(&delta.records[1])
+                .unwrap()
+                .terminal_handle,
+            3,
+        );
+        assert_eq!(delta.records[2].kind, RecordKind::Add);
+        assert_eq!(
+            yas_terminal::terminal_from_state_record(&delta.records[2]).unwrap(),
+            added,
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn desktop_handles_are_opaque_stable_and_never_reused() {
@@ -40435,6 +40706,27 @@ mod tests {
         ServerHello,
         tokio::task::JoinHandle<()>,
     ) {
+        start_registered_session_with_hello_extensions(
+            state,
+            family_ids,
+            max_buffered,
+            Extensions::default(),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn start_registered_session_with_hello_extensions(
+        state: AppState,
+        family_ids: &[u16],
+        max_buffered: u64,
+        extensions: Extensions,
+    ) -> (
+        DuplexStream,
+        FrameCodec,
+        ServerHello,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (mut client, server) = tokio::io::duplex(4 * 1024 * 1024);
         let cancellation = ConnectionCancellation::default();
         let registration = state
@@ -40452,8 +40744,13 @@ mod tests {
             None,
             ConnectionOrigin::Network,
         ));
-        let (codec, server_hello) =
-            handshake_with_receive(&mut client, family_ids, max_buffered).await;
+        let (codec, server_hello) = handshake_with_receive_and_extensions(
+            &mut client,
+            family_ids,
+            max_buffered,
+            extensions,
+        )
+        .await;
         (client, codec, server_hello, task)
     }
 
@@ -40834,6 +41131,7 @@ mod tests {
             channel_enabled: true,
             net_enabled: true,
             net_policy: super::super::net::Policy::default(),
+            net_only: false,
             events: None,
             fs: None,
             git: None,
@@ -46110,6 +46408,184 @@ mod tests {
         drop(watcher);
         timeout(TEST_TIMEOUT, watcher_task).await.unwrap().unwrap();
         process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_catalogue_republishes_reported_utf8_identifiers() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        // Controls and all, and reported by two sessions: the server passes it
+        // on regardless, for whoever reads the list to make sense of.
+        let odd = "pierre's\tlaptop 🖥";
+        let reporting = || {
+            Extensions(vec![
+                yas_wire::core::client_identifier_extension(odd).unwrap(),
+            ])
+        };
+        let (mut watcher, watcher_codec, watcher_hello, watcher_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::CLIENT],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (mut target, target_codec, target_hello, target_task) =
+            start_registered_session_with_hello_extensions(
+                state.clone(),
+                &[family::TERMINAL],
+                TEST_PEER_MAX_BUFFERED,
+                reporting(),
+            )
+            .await;
+        let (silent, _silent_codec, silent_hello, silent_task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        timeout(TEST_TIMEOUT, async {
+            while state.session.lock().await.native_yas_clients.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native clients registered directly");
+
+        write_request(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+            &Watch {
+                initial_credit: 1024 * 1024,
+                resume: None,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let watched = next_result(
+            &mut watcher,
+            &watcher_codec,
+            family::CLIENT,
+            yas_wire::schema::client::request::WATCH,
+            1,
+        )
+        .await;
+        assert_eq!(watched.status, Status::Ok);
+        let mut records = BTreeMap::new();
+        loop {
+            let frame = next_frame(&mut watcher, &watcher_codec).await;
+            if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                continue;
+            }
+            let event = StateEvent::decode(&frame.payload).unwrap();
+            for state_record in event.records {
+                if let Ok(record) = yas_client::client_from_state_record(&state_record) {
+                    records.insert(record.session_id, record);
+                }
+            }
+            if event.phase == Phase::SnapshotEnd {
+                break;
+            }
+        }
+        for session_id in [watcher_hello.session_id, target_hello.session_id] {
+            assert_eq!(records[&session_id].identifier().unwrap(), Some(odd));
+        }
+        assert_eq!(
+            records[&silent_hello.session_id].identifier().unwrap(),
+            None
+        );
+
+        // Not UTF-8, or longer than 1 KiB: refused, and the identifier stays.
+        let reported = yas_wire::core::client_identifier_extension("").unwrap();
+        let too_long = vec![b'a'; yas_wire::core::MAX_CLIENT_IDENTIFIER_BYTES + 1];
+        for (request_id, value) in [(2, vec![0xff]), (3, too_long)] {
+            write_request(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                request_id,
+                &Extensions(vec![Extension {
+                    value,
+                    ..reported.clone()
+                }]),
+            )
+            .await;
+            assert_eq!(
+                next_result(
+                    &mut target,
+                    &target_codec,
+                    family::CORE,
+                    yas_wire::core::request_kind::CLIENT_UPDATE,
+                    request_id,
+                )
+                .await
+                .status,
+                Status::Invalid,
+            );
+            assert_eq!(
+                state
+                    .session
+                    .lock()
+                    .await
+                    .native_yas_clients
+                    .get(&target_hello.session_id)
+                    .and_then(|client| client.identity.identifier.clone())
+                    .as_deref(),
+                Some(odd),
+            );
+        }
+
+        // CLIENT_UPDATE replaces it, and watchers see the record change.
+        write_request(
+            &mut target,
+            &target_codec,
+            family::CORE,
+            yas_wire::core::request_kind::CLIENT_UPDATE,
+            4,
+            &Extensions(vec![
+                yas_wire::core::client_identifier_extension("pierre's laptop").unwrap(),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            next_result(
+                &mut target,
+                &target_codec,
+                family::CORE,
+                yas_wire::core::request_kind::CLIENT_UPDATE,
+                4,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let frame = next_frame(&mut watcher, &watcher_codec).await;
+                if frame.header.family != family::CLIENT || frame.header.class != Class::Event {
+                    continue;
+                }
+                let event = StateEvent::decode(&frame.payload).unwrap();
+                if event.records.iter().any(|state_record| {
+                    yas_client::client_from_state_record(state_record).is_ok_and(|record| {
+                        record.session_id == target_hello.session_id
+                            && record.identifier() == Ok(Some("pierre's laptop"))
+                    })
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher saw the replaced identifier");
+
+        drop((target, silent));
+        timeout(TEST_TIMEOUT, target_task).await.unwrap().unwrap();
+        timeout(TEST_TIMEOUT, silent_task).await.unwrap().unwrap();
+        drop(watcher);
+        timeout(TEST_TIMEOUT, watcher_task).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -51793,7 +52269,7 @@ mod tests {
             yas_process_wire::Limits {
                 max_mutation_replays: MAX_PROCESS_OPERATION_REPLAYS as u32,
                 launcher_flags: if cfg!(unix) {
-                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS as u32
+                    yas_wire::schema::process::SPAWN_LAUNCHER_FLAGS_EXTENDED as u32
                 } else {
                     yas_wire::schema::process::SPAWN_STDIN_NULL as u32
                 },
@@ -52153,6 +52629,142 @@ mod tests {
         assert_eq!(stdout, input);
         assert!(stderr_bytes.is_empty());
         assert_eq!(stale_replay.unwrap().status, Status::Stale);
+
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_spawn_with_report_exit_is_sent_its_exit_without_a_wait() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let sh = std::env::split_paths(&std::env::var_os("PATH").expect("test PATH is set"))
+            .map(|directory| directory.join("sh"))
+            .find(|path| path.is_file())
+            .expect("sh is on PATH")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, codec, hello, server_task) =
+            start_registered_session(state, &[family::TRANSFER, family::PROCESS]).await;
+        let descriptor = hello
+            .families
+            .iter()
+            .find(|descriptor| descriptor.family_id == family::PROCESS)
+            .expect("Process negotiated");
+        let limits = yas_process_wire::Limits::from_extensions(&descriptor.limits).unwrap();
+        assert_ne!(
+            limits.launcher_flags & yas_wire::schema::process::SPAWN_REPORT_EXIT as u32,
+            0
+        );
+
+        let spawn = yas_process_wire::Spawn {
+            operation_id: [0x72; 16],
+            flags: (yas_wire::schema::process::SPAWN_REPORT_EXIT
+                | yas_wire::schema::process::SPAWN_STDIN_NULL) as u16,
+            environment_kind: yas_process_wire::EnvironmentKind::Empty,
+            cwd: yas_process_wire::Cwd::ServerDefault,
+            argv: vec![
+                sh,
+                b"-c".to_vec(),
+                b"printf out; printf err >&2; exit 3".to_vec(),
+            ],
+            env: Vec::new(),
+            stdout_receive_credit: 1024 * 1024,
+            stderr_receive_credit: 1024 * 1024,
+            extensions: Extensions::default(),
+        };
+        write_request(
+            &mut client,
+            &codec,
+            family::PROCESS,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+            &spawn,
+        )
+        .await;
+        let (spawned, _) = next_process_result_collecting_state(
+            &mut client,
+            &codec,
+            yas_process_wire::request_kind::SPAWN,
+            11,
+        )
+        .await;
+        assert_eq!(spawned.status, Status::Ok);
+        let streams = yas_process_wire::StreamBundle::decode(&spawned.body).unwrap();
+        assert!(streams.stdin.is_none());
+        let stderr = streams.stderr.as_ref().expect("separate stderr Transfer");
+
+        // No WAIT is sent: the exit comes on its own, next to the streams.
+        let mut stdout = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
+        let mut exit = None;
+        while !stdout_closed || !stderr_closed || exit.is_none() {
+            let frame = next_frame(&mut client, &codec).await;
+            match (frame.header.family, frame.header.kind) {
+                (family::PROCESS, yas_process_wire::event_kind::EXIT) => {
+                    assert_eq!(
+                        frame.header,
+                        FrameHeader {
+                            sensitive: true,
+                            ..FrameHeader::event(
+                                family::PROCESS,
+                                yas_process_wire::event_kind::EXIT,
+                            )
+                        }
+                    );
+                    assert!(exit.is_none(), "a second EXIT");
+                    let report = yas_process_wire::ExitReport::decode(&frame.payload).unwrap();
+                    assert_eq!(report.process_handle, streams.process_handle);
+                    assert_eq!(
+                        yas_process_wire::ExitReport::handle_of(&frame.payload),
+                        Some(streams.process_handle)
+                    );
+                    exit = Some(report.exit);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::BYTE_DATA) => {
+                    let data = ByteData::decode(&frame.payload).unwrap();
+                    let target = if data.transfer_id == streams.stdout.transfer_id {
+                        &mut stdout
+                    } else if data.transfer_id == stderr.transfer_id {
+                        &mut stderr_bytes
+                    } else {
+                        panic!("bytes for unknown Process Transfer")
+                    };
+                    assert_eq!(data.offset, target.len() as u64);
+                    target.extend_from_slice(&data.data);
+                }
+                (family::TRANSFER, yas_wire::schema::transfer::event::CLOSE) => {
+                    let close = Close::decode(&frame.payload).unwrap();
+                    assert_eq!(close.status, Status::Ok.code());
+                    if close.transfer_id == streams.stdout.transfer_id {
+                        assert_eq!(close.final_data_bytes, stdout.len() as u64);
+                        stdout_closed = true;
+                    } else if close.transfer_id == stderr.transfer_id {
+                        assert_eq!(close.final_data_bytes, stderr_bytes.len() as u64);
+                        stderr_closed = true;
+                    } else {
+                        panic!("CLOSE for unknown Process Transfer")
+                    }
+                }
+                _ => panic!(
+                    "unexpected native frame from a reported Process: {:?}",
+                    frame.header
+                ),
+            }
+        }
+        let exit = exit.unwrap();
+        assert_eq!(exit.kind, yas_process_wire::ExitKind::Code);
+        assert_eq!(exit.code, 3);
+        assert_ne!(exit.exited_server_ns, 0);
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr_bytes, b"err");
 
         drop(client);
         timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
@@ -53277,6 +53889,144 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_feedback_for_a_closed_view_does_not_end_the_session() {
+        let process_service = super::super::process::Server::new(false, true);
+        let state = super::super::tests::process_transport::test_state(process_service.clone());
+        let delivery_state = state.clone();
+        let delivery = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_state.delivery_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                let _ = super::super::tick(&delivery_state).await;
+            }
+        });
+        let (mut client, codec, _, task) =
+            start_registered_session(state.clone(), &[family::TERMINAL]).await;
+        let mut pending_frames = Vec::new();
+        let create = |operation: u8| yas_terminal::Create {
+            rows: 24,
+            cols: 80,
+            operation_id: [operation; 16],
+            launch: yas_terminal::Launch {
+                command: yas_terminal::Command::Argv(vec![
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"exec cat".to_vec(),
+                ]),
+                cwd: yas_terminal::Cwd::ServerDefault,
+                environment_base: yas_terminal::EnvironmentBase::Server,
+                environment: Vec::new(),
+                extensions: Extensions::default(),
+            },
+            extensions: Extensions::default(),
+        };
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            80,
+            &create(0x80),
+        )
+        .await;
+        let created = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CREATE,
+            80,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(created.status, Status::Ok);
+        let created = yas_terminal::CreateResult::decode(&created.body).unwrap();
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            81,
+            &yas_terminal::OpenView {
+                terminal_handle: created.terminal_handle,
+                rows: 24,
+                cols: 80,
+                max_fps: 60,
+                codec_versions: vec![1],
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let opened = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::OPEN_VIEW,
+            81,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let opened = yas_terminal::OpenViewResult::decode(&opened.body).unwrap();
+        let frame =
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CLOSE,
+            82,
+            &yas_terminal::Close {
+                terminal_handle: created.terminal_handle,
+                operation_id: [0x82; 16],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CLOSE,
+                82,
+                &mut pending_frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        acknowledge_terminal_frame(&mut client, &codec, &frame).await;
+
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CREATE,
+            83,
+            &create(0x83),
+        )
+        .await;
+        assert_eq!(
+            next_terminal_result(
+                &mut client,
+                &codec,
+                yas_wire::schema::terminal::request::CREATE,
+                83,
+                &mut pending_frames,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+
+        drop(client);
+        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        delivery.abort();
+        process_service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn terminal_close_drops_guarded_frames_before_the_result_boundary() {
         let process_service = super::super::process::Server::new(false, true);
         let state = super::super::tests::process_transport::test_state(process_service.clone());
@@ -53607,7 +54357,14 @@ mod tests {
                     }),
                     "closed Terminal survived the observer catalogue reset",
                 );
-                if saw_reset && state_event.phase == Phase::SnapshotEnd {
+                let removed = state_event.phase == Phase::Delta
+                    && state_event.records.iter().any(|record| {
+                        record.kind == RecordKind::Remove
+                            && yas_terminal::RemovedTerminal::decode(&record.body).is_ok_and(
+                                |removal| removal.terminal_handle == created.terminal_handle,
+                            )
+                    });
+                if removed || (saw_reset && state_event.phase == Phase::SnapshotEnd) {
                     break;
                 }
             }
@@ -55879,6 +56636,228 @@ mod tests {
             .expect("native YAS server did not stop")
             .unwrap();
         wait_for_server_diagnostics_to_clear(&diagnostics).await;
+    }
+
+    /// `--net-only` (docs/server.md § Net-only servers): a client offering
+    /// every family gets Core, Transfer and Net; a Request of any other
+    /// family is answered UNSUPPORTED, not left hanging; Core SHUTDOWN is not
+    /// a client's; TCP flows work, to listed targets only (strict: loopback
+    /// too must be listed).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn net_only_sessions_offer_net_alone_and_refuse_every_other_family() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let allowed = listener.local_addr().unwrap();
+        let unlisted = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unlisted_port = unlisted.local_addr().unwrap().port();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"hello from the database").await.unwrap();
+        });
+
+        let initial = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let mut inner = Arc::try_unwrap(initial).ok().expect("fresh test state");
+        inner.config.net_only = true;
+        inner.config.allow_forward = vec![format!("127.0.0.1:{}", allowed.port())];
+        let every: Vec<u16> = yas_wire::schema::FAMILIES
+            .iter()
+            .map(|metadata| metadata.id)
+            .filter(|family_id| *family_id != family::CORE)
+            .collect();
+        let state = Arc::new(inner);
+        let session = |state: AppState| {
+            let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+            let cancellation = ConnectionCancellation::default();
+            let registration = state
+                .connections
+                .register(cancellation.clone())
+                .expect("test session registers");
+            let task = tokio::spawn(serve_registered(
+                server,
+                Services::from_state(&state),
+                cancellation,
+                Some(registration),
+                None,
+                None,
+                ConnectionOrigin::Network,
+            ));
+            (client, task)
+        };
+        let hello_with = |required: Option<u16>| ClientHello {
+            min_minor: 1,
+            max_minor: 1,
+            receive: ReceiveLimits {
+                max_frame: SERVER_MAX_FRAME,
+                max_decoded: SERVER_MAX_DECODED,
+                max_datagram: 0,
+                max_buffered: TEST_PEER_MAX_BUFFERED,
+            },
+            client_instance: [7; 16],
+            client_name: "yas-server-test".to_owned(),
+            client_release: "1".to_owned(),
+            families: every
+                .iter()
+                .map(|family_id| FamilyOffer {
+                    family_id: *family_id,
+                    versions: vec![1],
+                    required: required == Some(*family_id),
+                })
+                .collect(),
+            codecs: Vec::new(),
+            extensions: Extensions::default(),
+        };
+        async fn hello_result(
+            client: &mut DuplexStream,
+            hello: ClientHello,
+        ) -> (FrameCodec, ResultPrefix) {
+            let frame = Frame {
+                header: FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1),
+                payload: hello.encode().unwrap(),
+            };
+            client.write_all(&yas_wire::PREFACE).await.unwrap();
+            client
+                .write_all(&FrameCodec::pre_hello().encode_stream(&frame).unwrap())
+                .await
+                .unwrap();
+            let codec = FrameCodec::new(FrameLimits::recommended(), []).unwrap();
+            let response = next_frame(client, &codec).await;
+            (codec, ResultPrefix::decode(&response.payload).unwrap())
+        }
+
+        // A client that requires another family is refused at HELLO.
+        let (mut refused, refused_task) = session(state.clone());
+        let (_, prefix) = hello_result(&mut refused, hello_with(Some(family::TERMINAL))).await;
+        assert_eq!(prefix.status, Status::Unsupported);
+        drop(refused);
+        let _ = timeout(TEST_TIMEOUT, refused_task).await.unwrap();
+
+        // One that offers every family gets Core, Transfer and Net.
+        let (mut client, server_task) = session(state);
+        let (codec, prefix) = hello_result(&mut client, hello_with(None)).await;
+        assert_eq!(prefix.status, Status::Ok);
+        let hello = ServerHello::decode(&prefix.body).unwrap();
+
+        let offered: Vec<u16> = hello
+            .families
+            .iter()
+            .map(|descriptor| descriptor.family_id)
+            .collect();
+        assert_eq!(offered, [family::CORE, family::TRANSFER, family::NET]);
+        let core = &hello.families[0];
+        assert!(core.operations.iter().all(|operation| {
+            !(operation.class == Class::Request
+                && operation.kind == yas_wire::core::request_kind::SHUTDOWN)
+        }));
+
+        let mut request_id = 101;
+        for metadata in yas_wire::schema::FAMILIES {
+            if matches!(metadata.id, family::CORE | family::TRANSFER | family::NET) {
+                continue;
+            }
+            let Some(operation) = metadata
+                .operations
+                .iter()
+                .find(|operation| operation.class == yas_wire::schema::transport::class::REQUEST)
+            else {
+                continue;
+            };
+            let mut header = FrameHeader::request(metadata.id, operation.kind, request_id);
+            header.sensitive = operation.sensitive == yas_wire::schema::transport::policy::REQUIRED;
+            client
+                .write_all(
+                    &codec
+                        .encode_stream(&Frame {
+                            header,
+                            payload: Vec::new(),
+                        })
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let answer = next_frame(&mut client, &codec).await;
+            assert_eq!(answer.header.class, Class::Result, "{}", metadata.name);
+            assert_eq!(answer.header.family, metadata.id, "{}", metadata.name);
+            assert_eq!(answer.header.request_id, Some(request_id));
+            assert_eq!(
+                ResultPrefix::decode(&answer.payload).unwrap().status,
+                Status::Unsupported,
+                "{} {}",
+                metadata.name,
+                operation.name
+            );
+            request_id += 2;
+        }
+
+        let open = |port: u16, operation: u8| yas_net::Open {
+            operation_id: [operation; 16],
+            address: yas_net::Address::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            },
+            delivery_preference: yas_net::DeliveryPreference::NotApplicable,
+            drop_policy: yas_net::DropPolicy::NotApplicable,
+            initial_receive_credit: 64 * 1024,
+            early_data: Vec::new(),
+            tls_options: None,
+            extensions: Extensions::default(),
+        };
+        write_request(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            3,
+            &open(unlisted_port, 41),
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut client,
+                &codec,
+                family::NET,
+                yas_wire::schema::net::request::OPEN,
+                3,
+            )
+            .await
+            .status,
+            Status::Unavailable,
+            "strict: unlisted loopback is refused by policy"
+        );
+
+        write_request(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            5,
+            &open(allowed.port(), 42),
+        )
+        .await;
+        let opened = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::NET,
+            yas_wire::schema::net::request::OPEN,
+            5,
+        )
+        .await;
+        assert_eq!(opened.status, Status::Ok);
+        let endpoint = yas_net::Endpoint::decode(&opened.body).unwrap();
+        let transfer = endpoint.descriptor.unwrap();
+        let data = next_frame(&mut client, &codec).await;
+        assert_eq!(
+            data.header.kind,
+            yas_wire::schema::transfer::event::BYTE_DATA
+        );
+        let data = ByteData::decode(&data.payload).unwrap();
+        assert_eq!(data.transfer_id, transfer.transfer_id);
+        assert_eq!(data.data, b"hello from the database");
+
+        timeout(TEST_TIMEOUT, target).await.unwrap().unwrap();
+        drop(client);
+        timeout(TEST_TIMEOUT, server_task).await.unwrap().unwrap();
     }
 
     #[tokio::test]

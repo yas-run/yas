@@ -540,6 +540,15 @@ pub enum Command {
             required = true
         )]
         allow_client: Vec<String>,
+
+        /// What carries the relay session: auto (WebTransport, else WebSocket
+        /// where UDP is blocked), webtransport or websocket
+        #[arg(
+            long,
+            env = "YAS_UPLINK_TRANSPORT",
+            value_parser = ["auto", "webtransport", "websocket"]
+        )]
+        transport: Option<String>,
     },
 
     /// Print an X25519 key pair as JSON (private_key and public_key, base64url)
@@ -734,9 +743,25 @@ pub enum Command {
         /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
         /// and ports is a comma-separated list of n or n-m. Repeatable (or
         /// set YAS_ALLOW_FORWARD to a comma-separated list). Unrestricted
-        /// when absent; loopback is always permitted.
+        /// when absent; loopback is always permitted unless
+        /// --allow-forward-strict.
         #[arg(long, value_name = "PATTERN")]
         allow_forward: Vec<String>,
+
+        /// Permit only the --allow-forward patterns (or set
+        /// YAS_ALLOW_FORWARD_STRICT=1): loopback only when listed, nothing
+        /// when none are given, and no Unix sockets or Windows pipes.
+        #[arg(long)]
+        allow_forward_strict: bool,
+
+        /// Serve the Net family alone, as a network connector (or set
+        /// YAS_NET_ONLY=1): HELLO offers Core, Transfer and Net, every other
+        /// family is refused and never started (no terminals or shell,
+        /// processes, files, compositor, KV, extensions…), clients cannot
+        /// shut it down, and the relay reaches only the --allow-forward
+        /// patterns (implies --allow-forward-strict).
+        #[arg(long)]
+        net_only: bool,
 
         /// Permit relayed TLS streams to skip certificate verification (or set
         /// YAS_ALLOW_FORWARD_INSECURE=1). Right for a self-signed dev server
@@ -1382,7 +1407,7 @@ pub enum TerminalCommand {
 
     /// Send input to a terminal.
     ///
-    /// Fails if the terminal has exited.
+    /// Fails if the terminal is unknown or has exited, even for empty input.
     /// Supports C-style escapes: \n \r \t \\ \0 \xHH.
     /// \n sends CR (Enter), matching real terminal behavior. Use \x0a for literal LF.
     /// To control interactive programs like vim:

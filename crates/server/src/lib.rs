@@ -62,6 +62,8 @@ mod net;
 mod nvdec_decode;
 mod nvenc_encode;
 #[cfg(any(unix, windows))]
+mod output_keep;
+#[cfg(any(unix, windows))]
 mod process;
 mod pty;
 mod read_only_stream;
@@ -482,13 +484,23 @@ pub struct Config {
     /// default, and worth leaving off when the server is embedded in a host
     /// binary whose directory holds no `yas`.
     pub inject_path: bool,
-    /// Permit relayed streams to skip TLS certificate verification
-    /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
-    /// wrong for anything reached across a network.
     /// `--allow-forward` egress patterns (docs/design/net.md § Target
     /// policy). Empty = unrestricted, the default.
     pub allow_forward: Vec<String>,
+    /// Permit relayed streams to skip TLS certificate verification
+    /// (`NET_OPEN_INSECURE`). Right for a self-signed dev server on loopback,
+    /// wrong for anything reached across a network.
     pub allow_forward_insecure: bool,
+    /// `--allow-forward-strict`: only `allow_forward` is reachable. Loopback
+    /// is not implied, an empty list reaches nothing, and Unix sockets and
+    /// Windows pipes are refused. `net_only` implies it.
+    pub allow_forward_strict: bool,
+    /// `--net-only`: a server that offers Core, Transfer and Net alone (a
+    /// network connector). Every other family is refused at HELLO and never
+    /// started: no terminals or shell, no processes, files, compositor,
+    /// surfaces, KV, environment, extensions, channels, Git or LSP. Implies
+    /// `allow_forward_strict`.
+    pub net_only: bool,
     /// Permit durable extension create/update/control and startup restore.
     /// True by default; `--no-persistent-extensions` turns it off, which is
     /// how a bad definition gets repaired. Transient extensions remain
@@ -957,6 +969,10 @@ struct NativeClientIdentity {
     client_instance: [u8; 16],
     name: String,
     release: String,
+    /// The identifier the client last reported (HELLO, then CLIENT_UPDATE):
+    /// UTF-8, and otherwise never validated or deduplicated, only republished
+    /// in its Client record so a list can say whose views size what.
+    identifier: Option<String>,
 }
 
 /// A YAS session registered directly with the shared backend. This is the
@@ -2431,8 +2447,12 @@ fn downscale_target_color_mode(
     }
 }
 
+/// Ask the compositor for a surface's pixels: the command, then `wake` for its
+/// loop (an idle one would see the command only at its next dispatch timeout, a
+/// second later), then the reply, or None after `timeout`.
 async fn request_surface_capture_with_timeout(
     command_tx: std::sync::mpsc::SyncSender<CompositorCommand>,
+    wake: impl FnOnce(),
     surface_id: u16,
     scale_120: u16,
     timeout: Duration,
@@ -2445,6 +2465,7 @@ async fn request_surface_capture_with_timeout(
             reply: tx,
         })
         .ok()?;
+    wake();
 
     // The compositor replies through a blocking std::sync::mpsc channel.
     // Wait for it off the async runtime so this request never stalls the
@@ -8547,11 +8568,26 @@ fn embedded_origin() -> ConnectionOrigin {
 /// be talking to a server that cannot answer.
 pub type HostedServices = Box<dyn FnOnce(LocalEndpoint) + Send>;
 
+fn env_flag_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1")
+}
+
 pub async fn run(config: Config) {
     run_hosted(config, None).await;
 }
 
-pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
+pub async fn run_hosted(mut config: Config, hosted: Option<HostedServices>) {
+    if config.net_only || env_flag_set("YAS_NET_ONLY") {
+        // A network connector: nothing but Net is ever offered, so nothing
+        // else is started (docs/server.md § Net-only servers).
+        config.net_only = true;
+        config.allow_forward_strict = true;
+        config.processes = false;
+        config.skip_compositor = true;
+        config.allow_persistent_extensions = false;
+        config.export_sock = false;
+        config.inject_path = false;
+    }
     // Embedders may not call `configure_deployment`; in that case freeze the
     // environment now, before any feature mask or service is constructed.
     let _ = ensure_deployment_settings();
@@ -8624,8 +8660,11 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     );
     let extensions =
         extension::ExtensionService::from_env(config.allow_persistent_extensions, &config.name);
-    let fonts = font::Service::from_env().await;
-    let relay = relay::Service::from_env();
+    let (fonts, relay) = if config.net_only {
+        (font::Service::disabled(), relay::Service::disabled())
+    } else {
+        (font::Service::from_env().await, relay::Service::from_env())
+    };
     let state: AppState = Arc::new(AppStateInner {
         config,
         events: event_log.clone(),
@@ -8665,7 +8704,9 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
             }
         }
     }
-    extensions.restore(state.clone()).await;
+    if !state.config.net_only {
+        extensions.restore(state.clone()).await;
+    }
 
     // Start the compositor eagerly so it is ready before any client
     // connects or any terminal is created.
@@ -8755,7 +8796,7 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     // § Storage): the load+hash of the whole database happens now, in the
     // background, instead of inline in the first connection's first KV
     // message. YAS_KV=0 disables the family, so nothing to warm.
-    if !std::env::var("YAS_KV").is_ok_and(|v| v == "0") {
+    if !state.config.net_only && !std::env::var("YAS_KV").is_ok_and(|v| v == "0") {
         kv::warm();
     }
 
@@ -13083,7 +13124,7 @@ fn spawn_yas_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let max = state.config.max_connections;
     let admitted = state
         .active_connections
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (max == 0 || current < max).then_some(current + 1)
         })
         .is_ok();
@@ -13221,6 +13262,8 @@ mod tests {
                     inject_path: false,
                     allow_forward: Vec::new(),
                     allow_forward_insecure: false,
+                    allow_forward_strict: false,
+                    net_only: false,
                     allow_persistent_extensions: false,
                 },
                 events: events::EventLog::new(
@@ -15744,12 +15787,22 @@ mod tests {
             })
             .unwrap();
 
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake = {
+            let woken = woken.clone();
+            move || woken.store(true, std::sync::atomic::Ordering::SeqCst)
+        };
         let result =
-            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
+            request_surface_capture_with_timeout(command_tx, wake, 7, 0, Duration::from_millis(50))
+                .await;
 
         let (w, h, pixels) = result.unwrap();
         assert_eq!((w, h), (2, 3));
         assert_eq!(pixels.to_rgba(w, h), vec![1, 2, 3, 4]);
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the compositor loop is woken for the command"
+        );
     }
 
     #[tokio::test]
@@ -15762,8 +15815,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            request_surface_capture_with_timeout(command_tx, 7, 0, Duration::from_millis(50)).await;
+        let result = request_surface_capture_with_timeout(
+            command_tx,
+            || {},
+            7,
+            0,
+            Duration::from_millis(50),
+        )
+        .await;
 
         assert!(result.is_none());
     }

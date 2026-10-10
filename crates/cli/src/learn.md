@@ -71,8 +71,8 @@ yas terminal send "$ID" "\x03"     # Ctrl+C
 ```
 
 Supports C-style escapes: `\n`, `\t`, `\r`, `\\`, `\0`, `\xHH`. Use `-` to read from stdin.
-Sending to an exited terminal fails with a nonzero exit instead of dropping the
-input.
+Sending to an unknown or exited terminal fails with a nonzero exit instead of
+dropping the input, even when the input is empty.
 
 `\n` sends CR (0x0D), which is what a real terminal sends for Enter. This works
 regardless of whether the program is in canonical or raw mode. `\r` also sends
@@ -178,6 +178,12 @@ A disconnected CLI exits with `yas: disconnected by the YAS server: REASON`
 when the disconnecting client gave a reason.
 
 Terminals persist until closed or the daemon exits. Clean up when done.
+
+A terminal shared by several viewers is sized to the smallest of them.
+`yas client list` shows each client's views and sizes, and ends each row with
+the identifier that client reported, if any; set `YAS_CLIENT_IDENTIFIER` to
+name your own connections that way. Identifiers are passed on as is: UTF-8 of
+at most 1 KiB, otherwise unchecked, not unique.
 
 `attach` needs a real tty on stdin and repaints the remote grid in the
 alternate screen, so your scrollback survives. It exits with the remote
@@ -497,8 +503,16 @@ speaks passes straight through, end to end.
 By default the relay reaches whatever the server reaches. To restrict it, give
 `yas server --allow-forward 'host[:ports]'` (a name, a `*.suffix` glob, an
 address, a CIDR block, or `*`; repeatable, or `YAS_ALLOW_FORWARD`) — one
-pattern makes it an allowlist, loopback still permitted. `YAS_NET=0` turns
-forwarding off entirely.
+pattern makes it an allowlist, loopback still permitted. Add
+`--allow-forward-strict` (`YAS_ALLOW_FORWARD_STRICT=1`) and only the patterns
+are reachable: loopback too only when listed, nothing when none are given, no
+Unix sockets. `YAS_NET=0` turns forwarding off entirely.
+
+A server that should do nothing but relay — a connector in a network you want
+to reach, uplinked out to a relay — runs `yas server --net-only --allow-forward
+db.internal:5432` (`YAS_NET_ONLY=1`): it offers Net alone (no terminals,
+processes, files, windows, KV or extensions; nothing else starts), clients
+cannot shut it down, and it implies `--allow-forward-strict`.
 
 UDP note: yas's wire is reliable and ordered, so relayed datagrams get
 retransmission and head-of-line blocking they did not ask for. Fine for

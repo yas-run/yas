@@ -1,0 +1,277 @@
+# YAS's release on Forge (xmit-dev/ultimator docs/CI.md), ported from .github/workflows/release.yml, which runs on
+# GitHub until Forge's phase P4. A tag v* is verified, tested, built for every platform and published.
+#
+# - The tag's signature: GitHub said whether a "verified identity" signed it; here git checks its SSH signature
+#   against YAS_TAG_SIGNERS (an allowed_signers file: `pc@rrier.fr ssh-ed25519 AAAA…`), a sealed secret only because
+#   admins alone set secrets (Forge has no repository variables yet): for yas-run/yas on refs/tags/v*. Without it, or
+#   unsigned, the release stops.
+# - GitHub Releases go with GitHub: the tarballs, zip and extension modules are kept as this run's artifact
+#   `release-<version>` (P4 gives them a home on Forge).
+# - crates.io takes the sealed secret CARGO_REGISTRY_TOKEN; npm takes NPM_TOKEN (a granular token), both for
+#   yas-run/yas on refs/tags/v*. Trusted publishing (OIDC) works from GitHub Actions only, so provenance is lost.
+name: release
+on:
+  push:
+    tags: ["v*"]
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify-tag:
+    name: Verify the tag's signature
+    runs-on: sandbox
+    timeout-minutes: 5
+    steps:
+      - uses: checkout
+        with:
+          fetch-depth: 0
+      - name: Verify the tag's SSH signature
+        env:
+          SIGNERS: ${{ secrets.YAS_TAG_SIGNERS }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [ -z "$SIGNERS" ]; then
+            echo "::error::No YAS_TAG_SIGNERS secret for this run: nothing to verify ${tag}'s signature against"
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          [ "$(git cat-file -t "$tag")" = tag ] || { echo "::error::${tag} isn't an annotated, signed tag"; exit 1; }
+          printf '%s\n' "$SIGNERS" > "$RUNNER_TEMP/allowed_signers"
+          if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-tag "$tag"; then
+            echo "::error::Tag ${tag} is not signed by an allowed signer"
+            exit 1
+          fi
+
+  lint:
+    name: Lint
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 60
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/lint --check
+      - run: ./bin/publish-crates --plan
+
+  test:
+    name: Tests
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 90
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/tests
+
+  e2e:
+    name: E2E
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 90
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/e2e
+
+  coverage:
+    name: Coverage
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 90
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/coverage
+
+  build-packages:
+    name: Packages (${{ matrix.label }})
+    needs: [verify-tag]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: sandbox
+            label: linux-x86_64
+          - runner: arm64-ci
+            label: linux-aarch64
+          - runner: crab
+            label: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/packages
+        with:
+          label: ${{ matrix.label }}
+      - uses: upload-artifact
+        with:
+          name: tarballs-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (x86_64, emulated)
+    needs: [verify-tag]
+    runs-on: crab-win
+    timeout-minutes: 150
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/windows-x64
+      - name: Package zips
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist licenses
+          cp vendor/yas-alacritty-terminal/LICENSE-APACHE licenses/yas-alacritty-terminal-APACHE-2.0.txt
+          for bin in yas; do
+            cp "target/release/${bin}.exe" "${bin}.exe"
+            7z a "dist/${bin}_${version}_windows_x86_64.zip" "${bin}.exe" LICENSE licenses
+            rm "${bin}.exe"
+          done
+          ls -lh dist/
+      - uses: upload-artifact
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # Wasm and bundled QuickJS modules are architecture-independent, so one job builds the extension objects every
+  # platform's release points at.
+  build-extensions:
+    name: Extensions
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 60
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/extensions
+      - uses: upload-artifact
+        with:
+          name: extensions
+          path: |
+            extensions/dist/*.wasm
+            extensions/dist/*.js
+            extensions/dist/manifest.json
+          if-no-files-found: error
+
+  protocol-fuzz:
+    name: Protocol fuzz (${{ matrix.target }})
+    needs: [verify-tag]
+    runs-on: sandbox
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, families, packed]
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - name: Sustained YAS wire fuzz campaign (${{ matrix.target }})
+        run: ./bin/fuzz
+        env:
+          YAS_FUZZ_SECONDS: "3600"
+          YAS_FUZZ_TARGET: ${{ matrix.target }}
+
+  release:
+    name: Release artifact
+    needs:
+      [
+        lint,
+        test,
+        e2e,
+        coverage,
+        build-packages,
+        build-windows,
+        build-extensions,
+        protocol-fuzz,
+      ]
+    runs-on: sandbox
+    timeout-minutes: 15
+    steps:
+      - uses: download-artifact
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: release
+      - uses: download-artifact
+        with:
+          name: windows-x86_64
+          path: release
+      - uses: download-artifact
+        with:
+          name: extensions
+          path: release
+      - name: Add stable latest-release asset names and checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cd release
+          for file in *.tar.gz *.zip; do
+            cp "$file" "${file/_${version}_/_}"
+          done
+          sha256sum -- * > SHA256SUMS
+          ls -lh
+      - uses: upload-artifact
+        with:
+          name: release-${{ github.ref_name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 400
+
+  publish-crates:
+    name: crates.io
+    needs: [release]
+    runs-on: sandbox
+    timeout-minutes: 60
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - run: ./bin/publish-crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    name: npm (packages)
+    needs: [release]
+    runs-on: sandbox
+    timeout-minutes: 30
+    steps:
+      - uses: checkout
+      - uses: ./.ultimator/actions/nix
+      - name: Publish with a granular token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          [ -n "$NODE_AUTH_TOKEN" ] || { echo "::error::No NPM_TOKEN secret for this run"; exit 1; }
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc"
+          printf '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}\n' > "$NPM_CONFIG_USERCONFIG"
+          ./bin/publish-npm-packages --access public
+
+  publish-bin-npm:
+    name: npm (binaries)
+    needs: [release]
+    runs-on: sandbox
+    timeout-minutes: 30
+    steps:
+      - uses: checkout
+      - uses: download-artifact
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: artifacts
+      - uses: download-artifact
+        with:
+          name: windows-x86_64
+          path: artifacts
+      - name: Build YAS binary npm packages
+        run: ./bin/build-npm-bin-packages artifacts dist/npm-bin "${GITHUB_REF_NAME#v}"
+      - name: Publish YAS binary npm packages with a granular token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          [ -n "$NODE_AUTH_TOKEN" ] || { echo "::error::No NPM_TOKEN secret for this run"; exit 1; }
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc"
+          printf '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}\n' > "$NPM_CONFIG_USERCONFIG"
+          ./bin/publish-npm-bin-packages dist/npm-bin --access public
