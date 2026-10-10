@@ -132,7 +132,9 @@ impl ObjectRead {
     }
 
     pub fn sync(&self) -> Result<(), ObjectStoreError> {
-        File::open(&self.path)?.sync_all()?;
+        // FlushFileBuffers needs write access: a read-only handle fails with
+        // ERROR_ACCESS_DENIED on Windows, so open for write (this does not modify the file).
+        OpenOptions::new().write(true).open(&self.path)?.sync_all()?;
         #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             File::open(parent)?.sync_all()?;
@@ -1923,6 +1925,18 @@ mod tests {
             }
         );
         hash
+    }
+
+    #[test]
+    fn durability_barrier_syncs_a_committed_object() {
+        // Windows refuses FlushFileBuffers on a read-only handle, which made
+        // every persistent deploy fail with Internal.
+        let root = temp_root("sync-object");
+        let mut store = ObjectStore::open(config(root.clone())).unwrap();
+        let hash = put(&mut store, 7, b"\0asm extension");
+        store.sync_object(&hash).unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
