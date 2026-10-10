@@ -101,6 +101,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `server_diagnostics_extension` | active_sessions:u32,relay_active:u32,relay_pending:u32,reserved:u32=0,aggregate_receive_limit:u64,aggregate_receive_buffered:u64; buffered<=limit |
 | `session_update` | catalog_revision:u64 nonzero,ReceiveLimits,Extensions; max_frame and max_decoded cannot decrease within a session |
 | `family_update` | catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor |
+| `client_identifier_extension` | ClientHello/CLIENT_UPDATE optional extension tag 5 exact value identifier:utf8 remaining, at most MAX_CLIENT_IDENTIFIER_BYTES bytes; the client's own text for people to recognize it by; invalid UTF-8 or a longer one fails HELLO or CLIENT_UPDATE with INVALID, and nothing else is validated or deduplicated; CLIENT_UPDATE replaces it; published as Client record extension IDENTIFIER_EXTENSION |
 | `initial_watches_extension` | count:u16,repeated family_id:u16,family_version:u16,watch_payload:bytes_u32 |
 | `initial_watch_results_extension` | count:u16,repeated embedded_watch_result:bytes_u32 |
 | `negotiated_codecs_extension` | count:u8,repeated codec:u16; nonzero,unique,ascending,subset of ClientHello codecs |
@@ -291,6 +292,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `bandwidth_rates` | ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord |
 | `auxiliary_subscription_details` | ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the namespace prefix for KV or canonical worktree/gitdir path for Git; Git state-watch request_flags contain datasets in bits 0..15 plus GIT_WATCH_UNTRACKED/GIT_WATCH_IGNORED effective selection; Git query-watch request_flags contain GIT_QUERY_WATCH, query kind shifted by GIT_QUERY_KIND_SHIFT, and query flags in bits 0..15; state_watch_flags use StateWatch flags |
 | `auxiliary_subscription_timings` | ClientRecord/ClientPatch optional extension tag 4 exact value count:u16,reserved:u16=0; repeated family:u16,refs_settle_ms:u16,subscription_id:u32,settle_ms:u16,reserved:u16=0; entries strictly sorted by family then subscription_id; configured delays after server-default resolution; settle_ms is Git status or FS settle delay, refs_settle_ms is Git ref settle delay and zero for FS |
+| `client_identifier` | ClientRecord/ClientPatch optional extension tag 5 exact value identifier:utf8 remaining, at most Core MAX_CLIENT_IDENTIFIER_BYTES bytes; the text the session last reported as Core CLIENT_HELLO_IDENTIFIER_EXTENSION in HELLO or CLIENT_UPDATE, unchanged and possibly shared by other sessions; absent when it reported none |
 | `family_limits` | ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor |
 
 ## `yas.surface` (`0x0020`/v1)
@@ -654,6 +656,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `query_list_entries` | repeated kind:u8,name:bytes_u16; one directory level without dot and dot-dot, hidden names included, in no defined order; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER describes the entry itself, so a symlink to a directory is ENTRY_SYMLINK; name is one nonempty raw platform-name component without NUL or slash |
 | `query_stat_only` | kind:u8,reserved:u8=0,reserved:u16=0,mode:u32,size:u64,modified_unix_ns:i64; kind ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK or ENTRY_OTHER; follows the final symlink unless READ_NO_FOLLOW; no content is read or hashed |
 | `stage_in_place` | STAGE_WRITE flag STAGE_IN_PLACE: COMMIT opens the target write-only with create and truncate, following a final symlink, writes the staged bytes and optionally syncs them; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; no temporary file and no rename; STAGE_CREATE_PARENTS with STAGE_IN_PLACE is INVALID |
+| `apply_in_place` | APPLY WRITE_INLINE item flag APPLY_ITEM_IN_PLACE, offered with CAPABILITY_APPLY_IN_PLACE: the item writes its content as COMMIT of a STAGE_IN_PLACE stage writes, opening the target write-only with create and truncate, following a final symlink, with no temporary file and no rename; an existing file keeps its inode, owner and mode; a new file gets mode, or 0o666 when mode is zero, less the server umask; the item result describes the file written; a directory at the destination is CONFLICT whose ApplyOsErrors entry is EISDIR open; APPLY_ITEM_CREATE_PARENTS with APPLY_ITEM_IN_PLACE is INVALID |
 
 ## `yas.git` (`0x0031`/v1)
 
@@ -892,6 +895,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | ---: | --- | --- | --- | --- | --- | --- |
 | `0x0000` | `STATE` | `server_to_client` | `required` | `allowed` | `forbidden` | StateEvent<ProcessRecord> |
 | `0x0001` | `STATE_ACK` | `client_to_server` | `allowed` | `allowed` | `forbidden` | StateAck |
+| `0x0002` | `EXIT` | `server_to_client` | `required` | `allowed` | `forbidden` | ExitReport |
 
 ### Limits
 
@@ -915,6 +919,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | 16 | `MAX_ENVC_EXTENDED` | 4 | false | 1 | 16384 |
 | 17 | `MAX_PENDING_WAITS` | 4 | false | 1 | 65536 |
 | 18 | `MAX_PENDING_OPERATIONS` | 4 | false | 1 | 16384 |
+| 19 | `LAUNCHER_FLAGS_EXTENDED` | 4 | false | 0 | 65535 |
 
 ### Shared types
 
@@ -923,6 +928,9 @@ Every Request kind has a correlated Result with the same family and kind.
 | `cwd` | kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16 |
 | `process_record` | process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions |
 | `remove_record` | process_handle:u64 |
+| `exit_report` | process_handle:u64,exit:bytes_u32 containing ExitRecord,Extensions; extension tag 1 stdout OutputElision, tag 2 stderr OutputElision, each present iff KEEP_OUTPUT dropped bytes of that stream |
+| `keep_output_extension` | SPAWN extension tag 4 exact value head_bytes:u64,tail_bytes:u64; only with SPAWN_KEEP_OUTPUT and SPAWN_REPORT_EXIT; tail_bytes at most MAX_KEEP_OUTPUT_TAIL_BYTES |
+| `output_elision` | offset:u64,bytes:u64,lines:u64,code_points:u64,utf16_units:u64; offset is the stream offset where the dropped bytes were (the head's length); lines, code points and UTF-16 units count them as a WHATWG UTF-8 decoder with replacement reads them within the whole stream |
 | `exit_record` | kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32 |
 | `stream_bundle` | process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions |
 | `state_entity_body` | ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64 |

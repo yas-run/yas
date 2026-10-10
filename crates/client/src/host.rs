@@ -4,7 +4,8 @@
 //! keeps the other end of that channel. Every [`HostedServer::connect`]
 //! creates a fresh socketpair, passes one end to the server over the channel
 //! (`SCM_RIGHTS`), and speaks YAS on the other: no listening socket has to be
-//! found, raced, or protected for those sessions.
+//! found, raced, or protected for those sessions. On macOS sessions use the
+//! server's private socket instead (see [macOS](#macos)).
 //!
 //! ```no_run
 //! # async fn demo() -> yas_client::Result<()> {
@@ -38,13 +39,28 @@
 //! [`HostOptions::socket`]), its log (`server.log`) and, with
 //! [`Isolation::Private`] (the default), its state, cache and runtime
 //! directories (`XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`), so
-//! it shares nothing with the user's own YAS servers. The server name
+//! it shares nothing with the user's own YAS servers. The server binds Unix
+//! sockets in its runtime directory (its desktop's), so when `<root>/run`
+//! would be too long for them, it gets a short temporary directory of its
+//! own instead, removed when the server is gone. The server name
 //! (`--name`) is unique unless set.
 //!
 //! The server also listens on that socket, because YAS servers always do;
 //! [`HostedServer::socket_path`] exposes it for tools that need a `YAS_SOCK`
 //! (`yas uplink`, a `yas` CLI run inside a hosted process). Only this user
 //! can reach it.
+//!
+//! # macOS
+//!
+//! On macOS every session connects to that private socket rather than being
+//! passed over the channel, which still bounds the server's lifetime. XNU's
+//! unix-socket garbage collector only scans the queues of sockets that are
+//! themselves in flight, so a passed socket whose other descriptors are
+//! closed looks unreachable while it waits in the server's end of the
+//! channel: whenever any unix socket on the machine closes before the server
+//! takes it, the collector flushes it, and the session reads EOF (its peer
+//! gets `EPIPE`). A server that is still starting, or is busy, loses
+//! sessions that way.
 //!
 //! # Environment
 //!
@@ -79,6 +95,12 @@ pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long [`HostedServer::shutdown`] waits for the server to exit after the
 /// channel closes before killing it, by default.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
+/// The longest private runtime directory a hosted server is given. The
+/// server binds its desktop's app sockets there, `yas-app-<32 hex>-<16 hex>`
+/// (`bind_surface_app_endpoint` in yas-server), and a socket path holds 103
+/// bytes on macOS and the BSDs, 107 on Linux.
+const RUNTIME_DIR_MAX: usize = 103 - "/yas-app-".len() - 32 - 1 - 16;
 
 /// Environment variables removed from an inherited environment.
 const REDIRECTING_VARIABLES: &[&str] = &[
@@ -287,6 +309,8 @@ pub struct HostedServer {
     channel: Mutex<Option<UnixStream>>,
     child: Option<std::process::Child>,
     root: Option<Root>,
+    /// The runtime directory, when `<root>/run` is too long for sockets.
+    short_runtime_dir: Option<tempfile::TempDir>,
     root_path: PathBuf,
     socket: PathBuf,
     name: String,
@@ -305,8 +329,8 @@ impl std::fmt::Debug for HostedServer {
 }
 
 impl HostedServer {
-    /// Start the server and wait until it answers a HELLO over the channel
-    /// and its socket exists.
+    /// Start the server and wait until it answers a HELLO and its socket
+    /// exists.
     ///
     /// Fails with [`Error::Connect`] (including the tail of its log) when
     /// the server cannot start, and [`Error::Invalid`] for a bad name.
@@ -367,17 +391,28 @@ impl HostedServer {
                 command.env_remove(key);
             }
         }
+        let mut short_runtime_dir = None;
         if options.isolation == Isolation::Private {
-            for (key, dir) in [
-                ("XDG_STATE_HOME", "state"),
-                ("XDG_CACHE_HOME", "cache"),
-                ("XDG_RUNTIME_DIR", "run"),
-            ] {
+            for (key, dir) in [("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache")] {
                 let path = root_path.join(dir);
                 create_private_dir(&path)
                     .map_err(|error| io_connect("cannot create a private directory", error))?;
                 command.env(key, path);
             }
+            let run = root_path.join("run");
+            let run = if run.as_os_str().len() <= RUNTIME_DIR_MAX {
+                create_private_dir(&run)
+                    .map_err(|error| io_connect("cannot create a private directory", error))?;
+                run
+            } else {
+                let dir = short_private_dir().map_err(|error| {
+                    io_connect(&format!("{} is too long for sockets", run.display()), error)
+                })?;
+                let path = dir.path().to_path_buf();
+                short_runtime_dir = Some(dir);
+                path
+            };
+            command.env("XDG_RUNTIME_DIR", run);
         }
         if !options.compositor {
             command.env("YAS_SKIP_COMPOSITOR", "1");
@@ -437,6 +472,7 @@ impl HostedServer {
             channel: Mutex::new(Some(ours)),
             child: Some(child),
             root: Some(root),
+            short_runtime_dir,
             root_path,
             socket,
             name,
@@ -467,7 +503,13 @@ impl HostedServer {
 
     async fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        let probe = tokio::time::timeout(timeout, self.connect_native()).await;
+        let probe = if SESSIONS_OVER_SOCKET {
+            let stream = self.wait_listening(deadline).await?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::timeout(remaining, self.native_on(stream)).await
+        } else {
+            tokio::time::timeout(timeout, self.connect_native()).await
+        };
         match probe {
             Ok(Ok(_client)) => {}
             Ok(Err(error)) => return Err(error),
@@ -488,6 +530,37 @@ impl HostedServer {
         Ok(())
     }
 
+    /// A connection to the socket, once the server listens on it.
+    async fn wait_listening(&mut self, deadline: Instant) -> Result<UnixStream> {
+        loop {
+            match UnixStream::connect(&self.socket) {
+                Ok(stream) => return Ok(stream),
+                // Not bound yet, or bound and not listening yet.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) => {}
+                Err(error) => {
+                    return Err(io_connect(
+                        &format!("cannot connect to {}", self.socket.display()),
+                        error,
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(format!(
+                    "socket {} did not appear",
+                    self.socket.display()
+                )));
+            }
+            if let Some(status) = self.try_wait() {
+                return Err(Error::Disconnected(format!("server exited ({status})")));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// A new [`Client`] session with the configured HELLO.
     pub async fn connect(&self) -> Result<Client> {
         self.connect_with(&self.hello).await
@@ -504,7 +577,10 @@ impl HostedServer {
 
     /// A new sequential [`NativeClient`] session.
     pub async fn connect_native(&self) -> Result<NativeClient> {
-        let stream = self.stream()?;
+        self.native_on(self.stream()?).await
+    }
+
+    async fn native_on(&self, stream: UnixStream) -> Result<NativeClient> {
         let transport = Transport::from_std_unix(stream)
             .map_err(|error| Error::Connect(format!("cannot register the stream: {error}")))?;
         NativeClient::connect_transport(transport, &self.hello).await
@@ -514,13 +590,25 @@ impl HostedServer {
     /// native YAS on it (starting with the preface and HELLO), or splice it
     /// to something that does (`yas connect --stdio` on the other side of a
     /// pipe, a relay).
+    ///
+    /// On macOS it is a connection to [`HostedServer::socket_path`] (see
+    /// [macOS](self#macos)); elsewhere, one end of a socketpair whose other
+    /// end went to the server over the channel.
     pub fn stream(&self) -> Result<UnixStream> {
-        let (ours, theirs) = UnixStream::pair()
-            .map_err(|error| Error::Connect(format!("cannot create a socketpair: {error}")))?;
         let channel = self.channel.lock().unwrap_or_else(|p| p.into_inner());
         let Some(channel) = channel.as_ref() else {
             return Err(Error::Closed);
         };
+        if SESSIONS_OVER_SOCKET {
+            return UnixStream::connect(&self.socket).map_err(|error| {
+                Error::Disconnected(format!(
+                    "cannot connect to the hosted YAS server socket {}: {error}",
+                    self.socket.display()
+                ))
+            });
+        }
+        let (ours, theirs) = UnixStream::pair()
+            .map_err(|error| Error::Connect(format!("cannot create a socketpair: {error}")))?;
         send_fd(channel.as_raw_fd(), theirs.as_raw_fd()).map_err(|error| {
             Error::Disconnected(format!("hosted YAS server channel failed: {error}"))
         })?;
@@ -610,6 +698,7 @@ impl Drop for HostedServer {
             return;
         };
         let root = self.root.take();
+        let short_runtime_dir = self.short_runtime_dir.take();
         // The server shuts down on channel EOF; reap it off-thread so drop
         // does not block, and kill it if it overstays the grace period.
         std::thread::spawn(move || {
@@ -631,7 +720,7 @@ impl Drop for HostedServer {
                     Ok(None) => std::thread::sleep(Duration::from_millis(20)),
                 }
             }
-            drop(root);
+            drop((root, short_runtime_dir));
         });
     }
 }
@@ -643,6 +732,42 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
         .mode(0o700)
         .create(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Whether sessions connect to the private socket instead of being passed
+/// over the channel (see [macOS](self#macos)).
+const SESSIONS_OVER_SOCKET: bool = cfg!(target_vendor = "apple");
+
+/// A fresh 0700 directory whose path fits [`RUNTIME_DIR_MAX`]: in this
+/// user's `XDG_RUNTIME_DIR`, else the temporary directory, else `/tmp`
+/// (macOS's temporary directory alone is about 50 bytes).
+fn short_private_dir() -> std::io::Result<tempfile::TempDir> {
+    const PREFIX: &str = "yas-run-";
+    // tempfile's random suffix is six characters.
+    const NAME: usize = PREFIX.len() + 6;
+    let short_enough =
+        |base: &PathBuf| base.is_absolute() && base.as_os_str().len() + 1 + NAME <= RUNTIME_DIR_MAX;
+    let bases = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([std::env::temp_dir(), PathBuf::from("/tmp")])
+        .filter(short_enough);
+    let mut last = None;
+    for base in bases {
+        match tempfile::Builder::new().prefix(PREFIX).tempdir_in(&base) {
+            Ok(dir) => {
+                create_private_dir(dir.path())?;
+                return Ok(dir);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no base directory is short enough",
+        )
+    }))
 }
 
 fn io_connect(what: &str, error: std::io::Error) -> Error {
