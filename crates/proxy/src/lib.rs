@@ -161,12 +161,23 @@ pub async fn ensure_proxy(
     proxy_bin: &std::path::Path,
     use_subcommand: bool,
 ) -> Result<String, String> {
+    ensure_proxy_with(proxy_bin, &[], use_subcommand).await
+}
+
+/// [`ensure_proxy`] for a program that carries the yas CLI as a subcommand of
+/// its own: `args` come before `proxy-daemon` (`["yas"]` for `ultimator yas`).
+pub async fn ensure_proxy_with(
+    proxy_bin: &std::path::Path,
+    args: &[std::ffi::OsString],
+    use_subcommand: bool,
+) -> Result<String, String> {
     let spec = proxy_socket_spec()?;
-    ensure_proxy_at(proxy_bin, use_subcommand, spec).await
+    ensure_proxy_at(proxy_bin, args, use_subcommand, spec).await
 }
 
 async fn ensure_proxy_at(
     proxy_bin: &std::path::Path,
+    args: &[std::ffi::OsString],
     use_subcommand: bool,
     spec: ProxySocketSpec,
 ) -> Result<String, String> {
@@ -201,6 +212,7 @@ async fn ensure_proxy_at(
     {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(proxy_bin);
+        cmd.args(args);
         if use_subcommand {
             cmd.arg("proxy-daemon");
         }
@@ -226,6 +238,7 @@ async fn ensure_proxy_at(
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = std::process::Command::new(proxy_bin);
+        cmd.args(args);
         if use_subcommand {
             cmd.arg("proxy-daemon");
         }
@@ -782,6 +795,8 @@ fn parse_uplink_uri(rest: &str) -> Result<UplinkTarget, String> {
     })
 }
 
+pub mod uplink_producer;
+
 /// HTTPS control client with the same explicit CA override semantics as the
 /// WSS and WebTransport legs. Reqwest's platform verifier otherwise ignores
 /// SSL_CERT_FILE/SSL_CERT_DIR on macOS.
@@ -1055,10 +1070,12 @@ async fn connect_ws_mode(
             .max_message_size(Some(64 * 1024))
             .max_frame_size(Some(64 * 1024))
     });
+    // Nagle's algorithm off (`disable_nagle`), as for tcp: upstreams: a request's small frames
+    // must not wait for the ACK of the one before, which the relay delays (40 ms on Linux).
     let (mut ws, response) = tokio_tungstenite::connect_async_tls_with_config(
         request,
         config,
-        false,
+        true,
         Some(yas_webrtc_forwarder::tls::websocket_connector()),
     )
     .await
@@ -2474,6 +2491,7 @@ mod tests {
         };
         let error = ensure_proxy_at(
             std::path::Path::new("/definitely-not-a-proxy-binary"),
+            &[],
             false,
             spec,
         )
@@ -2496,6 +2514,7 @@ mod tests {
         };
         let error = ensure_proxy_at(
             std::path::Path::new("/definitely-not-a-proxy-binary"),
+            &[],
             false,
             spec,
         )
