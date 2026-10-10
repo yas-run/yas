@@ -920,7 +920,7 @@ impl Drop for Watch {
 
 fn next_nonzero(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1).filter(|next| *next != 0)
         })
         .ok()
@@ -1214,6 +1214,14 @@ const fn case_behavior() -> u8 {
 
 fn append_wire_path(path: &mut PathBuf, relative: &wire::Path) -> Result<(), Error> {
     for component in &relative.components {
+        #[cfg(windows)]
+        {
+            let name = std::str::from_utf8(component)
+                .map_err(|_| Error::Invalid("invalid UTF-8 FS path component"))?;
+            if let Some(problem) = windows_name_problem(name) {
+                return Err(Error::Invalid(problem));
+            }
+        }
         let value = component_os(component);
         let mut parts = OsPath::new(&value).components();
         match (parts.next(), parts.next()) {
@@ -1222,6 +1230,54 @@ fn append_wire_path(path: &mut PathBuf, relative: &wire::Path) -> Result<(), Err
         }
     }
     Ok(())
+}
+
+/// Why Windows programs could not use `name` as a file name, if they could not. Every path the
+/// server touches is verbatim (`\\?\C:\…`), which would create names that the Win32 path rules
+/// (Explorer, cmd, Git, Node) turn into something else: `nul` or `com1.txt` into a device,
+/// `a.` or `a ` into `a`, `a:b` into a stream of `a`. Such components are refused rather
+/// than creating files nothing else can open or delete.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_name_problem(name: &str) -> Option<&'static str> {
+    if name.ends_with(['.', ' ']) {
+        return Some("a name Windows can't keep: it ends with a dot or a space");
+    }
+    if name
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Some("a character Windows doesn't allow in a name");
+    }
+    // A device name stays one with an extension, and with spaces before it.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let device = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|number| {
+            matches!(
+                number,
+                "0" | "1"
+                    | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        })
+    });
+    device.then_some("a name Windows reserves for a device")
 }
 
 fn relative_path(root: &Root, absolute: &OsPath) -> Result<wire::Path, Error> {
@@ -2480,18 +2536,67 @@ fn in_place_destination(root: &Root, target: &OsPath) -> Result<PathBuf, Error> 
     }))
 }
 
-/// COMMIT of a `STAGE_IN_PLACE` stage: open(2) the target write-only with
-/// O_CREAT|O_TRUNC through a final symlink and write the bytes, as Node's
-/// writeFile does. The file keeps its inode, owner and mode; no temporary
-/// file, no rename, so a failure can leave it truncated or partly written.
+/// COMMIT of a `STAGE_IN_PLACE` stage: its staged bytes written in place.
 fn commit_in_place(
     stage: &Stage,
     target: &OsPath,
     operation_id: [u8; 16],
     flags: u16,
 ) -> Result<wire::CommitResult, Error> {
-    let destination = in_place_destination(&stage.root, target)?;
-    let is_directory = || synthetic_os(conflict_for(&stage.root, &stage.path), EISDIR, "open");
+    let mut source = File::open(&stage.temp_path).map_err(os_io("open"))?;
+    let written = write_in_place(
+        &stage.root,
+        &stage.path,
+        target,
+        InPlace {
+            mode: stage.mode,
+            content_hash: stage.content_hash,
+            operation_id,
+            flags,
+        },
+        |file| io::copy(&mut source, file).map(|_| ()),
+    )?;
+    Ok(wire::CommitResult {
+        root_revision: stage.root.revision.load(Ordering::Acquire).max(1),
+        entry_revision: written.entry_revision,
+        modified_unix_ns: written.modified_unix_ns,
+        content_hash: stage.content_hash,
+    })
+}
+
+/// How an in-place write goes: the mode a file it creates gets (0: 0o666),
+/// the content's hash, the operation marking the entry, and COMMIT flags
+/// (`COMMIT_SYNC_DATA`, `COMMIT_SYNC_DIRECTORY`; APPLY gives none).
+struct InPlace {
+    /// Read on Unix alone: a file Windows creates takes its directory's ACL.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    mode: u32,
+    content_hash: [u8; 32],
+    operation_id: [u8; 16],
+    flags: u16,
+}
+
+/// What an in-place write reports: the entry written (through a symlink
+/// inside the root, the link's destination) and the file's modification time.
+struct WrittenInPlace {
+    entry_revision: u64,
+    modified_unix_ns: i64,
+}
+
+/// An in-place write (COMMIT of a `STAGE_IN_PLACE` stage, APPLY WRITE_INLINE
+/// with `APPLY_ITEM_IN_PLACE`): open(2) `target` write-only with
+/// O_CREAT|O_TRUNC through a final symlink and `write` the bytes, as Node's
+/// writeFile does. The file keeps its inode, owner and mode; no temporary
+/// file, no rename, so a failure can leave it truncated or partly written.
+fn write_in_place(
+    root: &Root,
+    path: &wire::Path,
+    target: &OsPath,
+    how: InPlace,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<WrittenInPlace, Error> {
+    let destination = in_place_destination(root, target)?;
+    let is_directory = || synthetic_os(conflict_for(root, path), EISDIR, "open");
     if fs::metadata(&destination).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(is_directory());
     }
@@ -2500,7 +2605,7 @@ fn commit_in_place(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if stage.mode != 0 { stage.mode } else { 0o666 });
+        options.mode(if how.mode != 0 { how.mode } else { 0o666 });
     }
     let mut file = match options.open(target) {
         Ok(file) => file,
@@ -2511,34 +2616,32 @@ fn commit_in_place(
         }
         Err(error) => return Err(os_io("open")(error)),
     };
-    let mut source = File::open(&stage.temp_path).map_err(os_io("open"))?;
-    io::copy(&mut source, &mut file).map_err(os_io("write"))?;
+    write(&mut file).map_err(os_io("write"))?;
     file.flush().map_err(os_io("write"))?;
-    if flags & schema::fs::COMMIT_SYNC_DATA as u16 != 0 {
+    if how.flags & schema::fs::COMMIT_SYNC_DATA as u16 != 0 {
         file.sync_all().map_err(os_io("fsync"))?;
     }
     drop(file);
-    if flags & schema::fs::COMMIT_SYNC_DIRECTORY as u16 != 0
+    if how.flags & schema::fs::COMMIT_SYNC_DIRECTORY as u16 != 0
         && let Some(parent) = destination.parent()
     {
         sync_directory(parent)?;
     }
     // Report the file written: through a symlink inside the root that is
     // the link's destination entry, not the link.
-    let written = if stage.root.single_file {
-        stage.path.clone()
+    let written = if root.single_file {
+        path.clone()
     } else {
-        relative_path(&stage.root, &destination).unwrap_or_else(|_| stage.path.clone())
+        relative_path(root, &destination).unwrap_or_else(|_| path.clone())
     };
-    mark_operation(&stage.root, &written, operation_id);
+    mark_operation(root, &written, how.operation_id);
     // The bytes are known and verified, so nothing is read back: a
     // write-only file answers as Node's writeFile would.
     let metadata = fs::metadata(&destination).map_err(os_io("stat"))?;
-    let named =
-        fs::symlink_metadata(joined_path(&stage.root, &written)?).map_err(os_io("lstat"))?;
+    let named = fs::symlink_metadata(joined_path(root, &written)?).map_err(os_io("lstat"))?;
     let entry_revision = if named.is_file() {
         observe_entry(
-            &stage.root,
+            root,
             wire::EntryRecord {
                 path: written.clone(),
                 entry_revision: 1,
@@ -2547,7 +2650,7 @@ fn commit_in_place(
                 modified_unix_ns: metadata_time(&named),
                 body: wire::EntryBody::File {
                     byte_len: named.len(),
-                    content_hash: stage.content_hash,
+                    content_hash: how.content_hash,
                     inline_content: None,
                 },
                 extensions: Extensions::default(),
@@ -2556,13 +2659,11 @@ fn commit_in_place(
         .entry_revision
     } else {
         // A single-file root that is itself a symlink: the link's entry.
-        stat_entry(&stage.root, &written, 0, false)?.entry_revision
+        stat_entry(root, &written, 0, false)?.entry_revision
     };
-    Ok(wire::CommitResult {
-        root_revision: stage.root.revision.load(Ordering::Acquire).max(1),
+    Ok(WrittenInPlace {
         entry_revision,
         modified_unix_ns: metadata_time(&metadata),
-        content_hash: stage.content_hash,
     })
 }
 
@@ -2576,8 +2677,9 @@ fn apply_items(
     let mut os_errors = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let outcome = apply_one(root, operation_id, item);
+        // A conflict carries one only where a check stood for a system call
+        // (an in-place write onto a directory is EISDIR, as COMMIT's).
         if let Err(error) = &outcome
-            && !matches!(error.kind(), Error::Conflict(_))
             && let Some(os) = error.os_error()
         {
             os_errors.push((index as u16, os.clone()));
@@ -2633,9 +2735,50 @@ fn apply_one(
         wire::ApplyItem::WriteInline {
             path,
             precondition,
+            create_parents: false,
+            mode,
+            content,
+            in_place: true,
+        } => {
+            check_precondition(root, path, precondition)?;
+            let target = mutation_target(root, path, false, "open")?;
+            let content_hash = *blake3::hash(content).as_bytes();
+            let written = write_in_place(
+                root,
+                path,
+                &target,
+                InPlace {
+                    mode: *mode,
+                    content_hash,
+                    operation_id,
+                    flags: 0,
+                },
+                |file| file.write_all(content),
+            )?;
+            Ok(wire::EntryRecord {
+                path: path.clone(),
+                entry_revision: written.entry_revision,
+                flags: 0,
+                mode: 0,
+                modified_unix_ns: written.modified_unix_ns,
+                body: wire::EntryBody::File {
+                    byte_len: content.len() as u64,
+                    content_hash,
+                    inline_content: None,
+                },
+                extensions: Extensions::default(),
+            })
+        }
+        wire::ApplyItem::WriteInline { in_place: true, .. } => {
+            Err(Error::Invalid("FS APPLY in-place write creating parents"))
+        }
+        wire::ApplyItem::WriteInline {
+            path,
+            precondition,
             create_parents,
             mode,
             content,
+            in_place: false,
         } => {
             check_precondition(root, path, precondition)?;
             atomic_write(root, path, *create_parents, *mode, content)?;
@@ -2965,6 +3108,56 @@ mod tests {
     }
 
     #[test]
+    fn windows_refuses_names_its_programs_cannot_use() {
+        for name in [
+            "nul",
+            "NUL",
+            "con.txt",
+            "aux.tar.gz",
+            "prn ",
+            "nul .txt",
+            "com1",
+            "LPT9.log",
+            "com0",
+            "COM\u{b9}",
+            "lpt\u{b3}.x",
+            "conin$",
+            "CONOUT$",
+            "a.",
+            "a ",
+            "a:b",
+            "a*b",
+            "what?",
+            "<x>",
+            "a|b",
+            "\"q\"",
+            "tab\there",
+        ] {
+            assert!(windows_name_problem(name).is_some(), "{name:?} passed");
+        }
+        for name in [
+            "a",
+            "nul-ish",
+            "console",
+            "com10",
+            "lpt",
+            "com",
+            "cons.txt",
+            ".gitignore",
+            "a.b",
+            " a",
+            "a b",
+            "é",
+            "COM\u{b9}0",
+            "auxiliary",
+            "file.nul",
+            "..x",
+        ] {
+            assert_eq!(windows_name_problem(name), None, "{name:?} refused");
+        }
+    }
+
+    #[test]
     fn stat_uses_full_hash_and_monotonic_entry_revisions() {
         let directory = TestDir::new();
         fs::write(directory.0.join("value"), b"first").unwrap();
@@ -3181,6 +3374,7 @@ mod tests {
                 create_parents: false,
                 mode: 0,
                 content: b"one".to_vec(),
+                in_place: false,
             },
             wire::ApplyItem::Rename {
                 from: path(&[b"a"]),
@@ -3720,9 +3914,108 @@ mod tests {
         }
     }
 
+    /// An in-place write of `bytes` to `components` with `mode` under
+    /// `operation_id`, answering the content hash it reports.
+    #[cfg(unix)]
+    type WriteInPlace =
+        dyn Fn(&Arc<Root>, &[&[u8]], u32, &[u8], [u8; 16]) -> Result<[u8; 32], Error>;
+
     #[cfg(unix)]
     #[test]
     fn stage_in_place_keeps_the_inode_and_writes_through_symlinks() {
+        in_place_keeps_the_inode_and_writes_through_symlinks(
+            &|root, components, mode, bytes, id| {
+                let stage = sealed_stage(root, components, mode, bytes);
+                commit_stage(stage, id, schema::fs::COMMIT_SYNC_DATA as u16)
+                    .map(|result| result.content_hash)
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_in_place_writes_as_commit_in_place_does() {
+        in_place_keeps_the_inode_and_writes_through_symlinks(
+            &|root, components, mode, bytes, id| {
+                let item = wire::ApplyItem::WriteInline {
+                    path: path(components),
+                    precondition: wire::Precondition::Any,
+                    create_parents: false,
+                    mode,
+                    content: bytes.to_vec(),
+                    in_place: true,
+                };
+                let entry = apply_one(root, id, &item)?;
+                assert_eq!(entry.path, path(components));
+                Ok(entry_hash(&entry).unwrap())
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_apply_in_place_onto_a_directory_is_a_conflict_saying_eisdir() {
+        let directory = TestDir::new();
+        let root = test_root(&directory);
+        fs::create_dir(directory.0.join("dir")).unwrap();
+        fs::write(directory.0.join("file"), b"old").unwrap();
+        let write = |name: &[u8], in_place| wire::ApplyItem::WriteInline {
+            path: path(&[name]),
+            precondition: wire::Precondition::Any,
+            create_parents: false,
+            mode: 0,
+            content: b"x".to_vec(),
+            in_place,
+        };
+        let result = apply_items(
+            &root,
+            [9; 16],
+            &[
+                write(b"file", true),
+                write(b"dir", true),
+                write(b"dir", false),
+            ],
+        )
+        .unwrap();
+        let statuses: Vec<u16> = result.items.iter().map(|item| item.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                schema::core::status::OK,
+                schema::core::status::CONFLICT,
+                schema::core::status::CONFLICT
+            ]
+        );
+        assert_eq!(fs::read(directory.0.join("file")).unwrap(), b"x");
+        // The in-place write says EISDIR, as COMMIT's; the replacing write
+        // keeps its bare conflict.
+        let os_errors = result.os_errors().unwrap();
+        assert_eq!(os_errors.len(), 1);
+        assert_eq!(os_errors[0].0, 1);
+        assert_eq!(
+            (
+                os_errors[0].1.name.as_str(),
+                os_errors[0].1.operation.as_str()
+            ),
+            ("EISDIR", "open")
+        );
+        // Creating parents is never in place.
+        let item = wire::ApplyItem::WriteInline {
+            path: path(&[b"new", b"file"]),
+            precondition: wire::Precondition::Any,
+            create_parents: true,
+            mode: 0,
+            content: b"x".to_vec(),
+            in_place: true,
+        };
+        assert!(matches!(
+            apply_one(&root, [10; 16], &item).unwrap_err().kind(),
+            Error::Invalid(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn in_place_keeps_the_inode_and_writes_through_symlinks(write: &WriteInPlace) {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
         let directory = TestDir::new();
         let root = Arc::new(test_root(&directory));
@@ -3732,8 +4025,7 @@ mod tests {
         let inode = fs::metadata(&target).unwrap().ino();
         symlink("target.txt", directory.0.join("link")).unwrap();
 
-        let stage = sealed_stage(&root, &[b"link"], 0o600, b"new");
-        let result = commit_stage(stage, [4; 16], schema::fs::COMMIT_SYNC_DATA as u16).unwrap();
+        let hash = write(&root, &[b"link"], 0o600, b"new", [4; 16]).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
         let metadata = fs::metadata(&target).unwrap();
         assert_eq!(metadata.ino(), inode);
@@ -3744,7 +4036,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(result.content_hash, *blake3::hash(b"new").as_bytes());
+        assert_eq!(hash, *blake3::hash(b"new").as_bytes());
         assert_eq!(
             root.operation_echoes
                 .lock()
@@ -3754,13 +4046,11 @@ mod tests {
         );
 
         // A new file is created where it is named, without a temporary.
-        let stage = sealed_stage(&root, &[b"fresh"], 0, b"fresh bytes");
-        commit_stage(stage, [5; 16], 0).unwrap();
+        write(&root, &[b"fresh"], 0, b"fresh bytes", [5; 16]).unwrap();
         assert_eq!(fs::read(directory.0.join("fresh")).unwrap(), b"fresh bytes");
         // Through a dangling symlink, the file it names is created.
         symlink("made-by-link", directory.0.join("pending")).unwrap();
-        let stage = sealed_stage(&root, &[b"pending"], 0, b"via link");
-        commit_stage(stage, [6; 16], 0).unwrap();
+        write(&root, &[b"pending"], 0, b"via link", [6; 16]).unwrap();
         assert_eq!(
             fs::read(directory.0.join("made-by-link")).unwrap(),
             b"via link"
@@ -3770,13 +4060,8 @@ mod tests {
         let write_only = directory.0.join("write-only");
         fs::write(&write_only, b"previous").unwrap();
         fs::set_permissions(&write_only, fs::Permissions::from_mode(0o200)).unwrap();
-        let result = commit_stage(
-            sealed_stage(&root, &[b"write-only"], 0, b"blind"),
-            [11; 16],
-            0,
-        )
-        .unwrap();
-        assert_eq!(result.content_hash, *blake3::hash(b"blind").as_bytes());
+        let hash = write(&root, &[b"write-only"], 0, b"blind", [11; 16]).unwrap();
+        assert_eq!(hash, *blake3::hash(b"blind").as_bytes());
         let metadata = fs::metadata(&write_only).unwrap();
         assert_eq!(
             (metadata.permissions().mode() & 0o7777, metadata.len()),
@@ -3788,17 +4073,14 @@ mod tests {
         fs::create_dir(directory.0.join("dir")).unwrap();
         symlink("dir", directory.0.join("dir-link")).unwrap();
         for components in [&[&b"dir"[..]][..], &[b"dir-link"]] {
-            let stage = sealed_stage(&root, components, 0, b"x");
-            let error = commit_stage(stage, [7; 16], 0).unwrap_err();
+            let error = write(&root, components, 0, b"x", [7; 16]).unwrap_err();
             assert!(matches!(error.kind(), Error::Conflict(_)));
             assert_eq!(os_of(&error), (libc::EISDIR, "EISDIR", "open"));
         }
-        let stage = sealed_stage(&root, &[b"nope", b"file"], 0, b"x");
-        let error = commit_stage(stage, [8; 16], 0).unwrap_err();
+        let error = write(&root, &[b"nope", b"file"], 0, b"x", [8; 16]).unwrap_err();
         assert_eq!(*error.kind(), Error::NotFound);
         assert_eq!(os_of(&error), (libc::ENOENT, "ENOENT", "open"));
-        let stage = sealed_stage(&root, &[b"target.txt", b"file"], 0, b"x");
-        let error = commit_stage(stage, [10; 16], 0).unwrap_err();
+        let error = write(&root, &[b"target.txt", b"file"], 0, b"x", [10; 16]).unwrap_err();
         assert_eq!(os_of(&error), (libc::ENOTDIR, "ENOTDIR", "open"));
     }
 }

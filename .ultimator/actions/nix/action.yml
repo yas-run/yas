@@ -1,0 +1,24 @@
+# Nix for a Forge CI job (xmit-dev/ultimator docs/CI.md), in place of DeterminateSystems/nix-installer-action and
+# magic-nix-cache-action, which are Marketplace actions Forge doesn't run. A machine that has Nix (crab) keeps its own;
+# a fresh sandbox gets it from Determinate's installer, with flakes on. There is no binary cache beyond cache.nixos.org:
+# a sandbox's first build of the flake's toolchain is cold.
+name: nix
+description: Nix with flakes, on PATH for the job's later steps
+runs:
+  using: composite
+  steps:
+    - name: Nix
+      shell: bash
+      run: |
+        if ! command -v nix >/dev/null; then
+          for profile in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh "$HOME/.nix-profile/etc/profile.d/nix.sh"; do
+            if [ -f "$profile" ]; then . "$profile"; break; fi
+          done
+        fi
+        if ! command -v nix >/dev/null; then
+          curl --proto '=https' --tlsv1.2 -sSfL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+        fi
+        dirname "$(command -v nix)" >> "$GITHUB_PATH"
+        nix --version
+        nix config show experimental-features | grep -qw flakes || echo "NIX_CONFIG=experimental-features = nix-command flakes" >> "$GITHUB_ENV"
