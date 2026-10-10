@@ -20,7 +20,7 @@
 //! terminates every ordinary process it spawned; see [`crate::process`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -51,6 +51,8 @@ pub(crate) enum Route {
     Transfer(u32),
     /// State events for one `(family, subscription_id)`.
     State(u16, u32),
+    /// Process EXIT events for one process handle (a SPAWN with REPORT_EXIT).
+    ProcessExit(u64),
 }
 
 /// Registered by a call: run by the reader on an OK `Result`, before any later
@@ -63,12 +65,49 @@ pub(crate) type FrameReceiver = mpsc::UnboundedReceiver<Frame>;
 pub(crate) struct Reply {
     pub(crate) prefix: ResultPrefix,
     routes: Vec<(Route, FrameReceiver)>,
+    /// With a [`Route::ProcessExit`]: told if that process's attachment goes first.
+    report_lost: Option<Arc<ReportLost>>,
 }
 
 impl Reply {
     pub(crate) fn take(&mut self, route: Route) -> Option<FrameReceiver> {
         let index = self.routes.iter().position(|(key, _)| *key == route)?;
         Some(self.routes.swap_remove(index).1)
+    }
+
+    pub(crate) fn take_report_lost(&mut self) -> Option<Arc<ReportLost>> {
+        self.report_lost.take()
+    }
+}
+
+/// Marked when the attachment that would report a process's exit (SPAWN_REPORT_EXIT) goes
+/// before it: a Transfer RESET, sent or received, on any of its streams, or a DETACH. The
+/// server then sends no EXIT, and the exit is asked for with WAIT.
+#[derive(Debug, Default)]
+pub(crate) struct ReportLost {
+    lost: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReportLost {
+    pub(crate) fn mark(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Once marked.
+    pub(crate) async fn lost(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_lost() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -86,6 +125,8 @@ struct Router {
     orphan_bytes: usize,
     released: HashSet<Route>,
     released_order: VecDeque<Route>,
+    /// The open transfers of processes that report their exit: a RESET on one marks it.
+    report_watch: HashMap<u32, Arc<ReportLost>>,
     closed: Option<Error>,
 }
 
@@ -106,6 +147,9 @@ impl Router {
 
     fn release(&mut self, route: Route) {
         self.routes.remove(&route);
+        if let Route::Transfer(transfer_id) = route {
+            self.report_watch.remove(&transfer_id);
+        }
         if let Some(frames) = self.orphans.remove(&route) {
             for frame in frames {
                 self.orphan_bytes = self.orphan_bytes.saturating_sub(frame.payload.len());
@@ -119,6 +163,16 @@ impl Router {
                     self.released.remove(&old);
                 }
             }
+        }
+    }
+
+    /// A transfer closed, or reset (either way): a reset one's process, if it reports its
+    /// exit, will not.
+    fn transfer_ended(&mut self, transfer_id: u32, reset: bool) {
+        if let Some(lost) = self.report_watch.remove(&transfer_id)
+            && reset
+        {
+            lost.mark();
         }
     }
 
@@ -161,6 +215,7 @@ impl Router {
         // Dropping the senders ends every stream and subscription; they then
         // report the session error.
         self.routes.clear();
+        self.report_watch.clear();
         self.orphans.clear();
         self.orphan_order.clear();
         self.orphan_bytes = 0;
@@ -171,11 +226,19 @@ struct Shared {
     hello: RwLock<ServerHello>,
     router: Mutex<Router>,
     closed: watch::Sender<Option<Error>>,
+    /// Net datagram flows by flow handle: each a bounded, drop-oldest queue
+    /// (a slow reader loses datagrams, as UDP does, instead of growing one).
+    datagrams: Mutex<HashMap<u64, Arc<crate::net::DatagramState>>>,
+    /// Bounds this session's Net opens in flight to the server's limit.
+    net_opens: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Shared {
     fn close(&self, error: Error) {
         self.router.lock().unwrap().fail(error.clone());
+        for (_, flow) in self.datagrams.lock().unwrap().drain() {
+            flow.fail(error.clone());
+        }
         self.closed.send_if_modified(|current| {
             if current.is_none() {
                 *current = Some(error);
@@ -194,6 +257,10 @@ struct Inner {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The session clock that input events' `client_monotonic_ns` count on.
     started: std::time::Instant,
+    /// What this client offered to receive at once ([`HelloOptions::receive_budget`]).
+    receive_budget: u64,
+    /// The lossy datagram sideband's sender, when the transport has one.
+    datagram_sender: Option<NativeFrameSender>,
 }
 
 impl Drop for Inner {
@@ -262,12 +329,17 @@ impl Client {
     /// runtime: it spawns the reader and writer tasks.
     pub fn from_native(native: NativeClient) -> Self {
         let hello = native.hello().clone();
+        let receive_budget = native.receive_budget();
+        let supports_datagrams = native.supports_datagrams();
         let (reader, sender) = native.into_framed();
+        let datagram_sender = supports_datagrams.then(|| sender.clone());
         let (closed, _) = watch::channel(None);
         let shared = Arc::new(Shared {
             hello: RwLock::new(hello),
             router: Mutex::new(Router::default()),
             closed,
+            datagrams: Mutex::new(HashMap::new()),
+            net_opens: std::sync::OnceLock::new(),
         });
         let (outbound, outbound_rx) = mpsc::unbounded_channel();
         let writer = tokio::spawn(write_loop(sender, outbound_rx, Arc::clone(&shared)));
@@ -279,6 +351,8 @@ impl Client {
                 next_request_id: AtomicU32::new(3),
                 tasks: vec![writer, reader],
                 started: std::time::Instant::now(),
+                receive_budget,
+                datagram_sender,
             }),
         }
     }
@@ -286,6 +360,13 @@ impl Client {
     /// The server's HELLO answer, updated by catalogue changes.
     pub fn hello(&self) -> ServerHello {
         self.inner.shared.hello.read().unwrap().clone()
+    }
+
+    /// How many bytes the server may have on their way to this session at
+    /// once, as this client offered in HELLO
+    /// ([`HelloOptions::receive_budget`]).
+    pub fn receive_budget(&self) -> u64 {
+        self.inner.receive_budget
     }
 
     /// The server instance name (`default`, or the `--name` it runs under).
@@ -399,9 +480,72 @@ impl Client {
         Ok(R::decode(&reply.prefix.body)?)
     }
 
+    /// Replace the identifier this session reported in HELLO (the `identifier`
+    /// of its [`HelloOptions`](crate::HelloOptions)) with Core CLIENT_UPDATE.
+    /// Client catalogue watchers see it at their next refresh. A read-only
+    /// session cannot: its HELLO identifier stays.
+    pub async fn set_identifier(&self, identifier: &str) -> Result<()> {
+        let extension = yas_wire::core::client_identifier_extension(identifier)
+            .map_err(|error| Error::invalid(format!("invalid client identifier: {error}")))?;
+        let extensions = yas_wire::Extensions(vec![extension]);
+        self.call_ok(
+            yas_wire::family::CORE,
+            yas_wire::core::request_kind::CLIENT_UPDATE,
+            extensions.encode()?,
+            Some(DEFAULT_REQUEST_TIMEOUT),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Nanoseconds on this session's clock, for input events.
     pub(crate) fn monotonic_ns(&self) -> u64 {
         u64::try_from(self.inner.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the transport carries a lossy datagram sideband.
+    pub(crate) fn supports_datagrams(&self) -> bool {
+        self.inner.datagram_sender.is_some()
+    }
+
+    /// Try one frame on the lossy datagram sideband.
+    pub(crate) fn try_send_datagram(
+        &self,
+        frame: &Frame,
+        context: yas_wire::frame::DatagramContext,
+    ) -> Result<crate::transport::DatagramSend> {
+        let Some(sender) = &self.inner.datagram_sender else {
+            return Ok(crate::transport::DatagramSend::Closed);
+        };
+        let maximum = self.inner.shared.hello.read().unwrap().receive.max_datagram;
+        sender.try_send_datagram(frame, maximum, context)
+    }
+
+    /// The registry Net datagram flows are delivered through.
+    pub(crate) fn datagrams(&self) -> Datagrams {
+        Datagrams(Arc::downgrade(&self.inner.shared))
+    }
+
+    /// The semaphore bounding Net opens in flight, made on first use.
+    pub(crate) fn net_opens(&self, permits: usize) -> Arc<tokio::sync::Semaphore> {
+        self.inner
+            .shared
+            .net_opens
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(permits.max(1))))
+            .clone()
+    }
+
+    /// Send one Request whose `Result` nobody waits for (a fire-and-forget
+    /// Net `CLOSE` from a destructor): its late `Result` is ignored.
+    pub(crate) fn send_request_detached(&self, family_id: u16, kind: u16, payload: Vec<u8>) {
+        if !self.supports(family_id, Class::Request, kind) {
+            return;
+        }
+        let request_id = self.next_request_id();
+        let mut header = FrameHeader::request(family_id, kind, request_id);
+        header.sensitive = default_sensitive(family_id, Class::Request, kind);
+        let _ = self.send_frame(Frame { header, payload });
     }
 
     pub(crate) fn release(&self, route: Route) {
@@ -411,6 +555,16 @@ impl Client {
     pub(crate) fn send_frame(&self, frame: Frame) -> Result<()> {
         if let Some(error) = self.closed_reason() {
             return Err(error);
+        }
+        if frame.header.kind == yas_wire::transfer::kind::RESET
+            && let Some(transfer_id) = transfer_event_id(&frame)
+        {
+            self.inner
+                .shared
+                .router
+                .lock()
+                .unwrap()
+                .transfer_ended(transfer_id, true);
         }
         self.inner
             .outbound
@@ -578,7 +732,7 @@ async fn write_loop(
 async fn read_loop(mut reader: NativeFrameReader, shared: Arc<Shared>) {
     let mut revision = reader.hello().catalog_revision;
     loop {
-        let frame = match reader.next().await {
+        let (frame, transport_datagram) = match reader.next_with_source().await {
             Ok(frame) => frame,
             Err(error) => {
                 shared.close(error);
@@ -589,14 +743,14 @@ async fn read_loop(mut reader: NativeFrameReader, shared: Arc<Shared>) {
             revision = reader.hello().catalog_revision;
             *shared.hello.write().unwrap() = reader.hello().clone();
         }
-        if let Err(error) = dispatch(&shared, frame) {
+        if let Err(error) = dispatch(&shared, frame, transport_datagram) {
             shared.close(error);
             return;
         }
     }
 }
 
-fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
+fn dispatch(shared: &Shared, frame: Frame, transport_datagram: bool) -> Result<()> {
     match frame.header.class {
         Class::Result => {
             let Some(request_id) = frame.header.request_id else {
@@ -617,7 +771,26 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
                     routes.push((route, receiver));
                 }
             }
-            if pending.reply.send(Ok(Reply { prefix, routes })).is_err() {
+            // A process that reports its exit: any of its transfers reset (its attachment
+            // went) means no EXIT comes.
+            let report_lost = routes
+                .iter()
+                .any(|(route, _)| matches!(route, Route::ProcessExit(_)))
+                .then(|| {
+                    let lost = Arc::new(ReportLost::default());
+                    for (route, _) in &routes {
+                        if let Route::Transfer(transfer_id) = route {
+                            router.report_watch.insert(*transfer_id, lost.clone());
+                        }
+                    }
+                    lost
+                });
+            let reply = Reply {
+                prefix,
+                routes,
+                report_lost,
+            };
+            if pending.reply.send(Ok(reply)).is_err() {
                 // The caller went away between sending and now.
             }
             Ok(())
@@ -625,11 +798,30 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
         Class::Event => {
             if frame.header.family == family::TRANSFER {
                 if let Some(transfer_id) = transfer_event_id(&frame) {
+                    let mut router = shared.router.lock().unwrap();
+                    let kind = frame.header.kind;
+                    if matches!(
+                        kind,
+                        yas_wire::transfer::kind::CLOSE | yas_wire::transfer::kind::RESET
+                    ) {
+                        router.transfer_ended(transfer_id, kind == yas_wire::transfer::kind::RESET);
+                    }
+                    router.deliver(Route::Transfer(transfer_id), frame);
+                }
+                return Ok(());
+            }
+            if frame.header.family == family::NET {
+                return crate::net::dispatch_event(&shared.datagrams, frame, transport_datagram);
+            }
+            if frame.header.family == family::PROCESS
+                && frame.header.kind == yas_wire::process::event_kind::EXIT
+            {
+                if let Some(handle) = yas_wire::process::ExitReport::handle_of(&frame.payload) {
                     shared
                         .router
                         .lock()
                         .unwrap()
-                        .deliver(Route::Transfer(transfer_id), frame);
+                        .deliver(Route::ProcessExit(handle), frame);
                 }
                 return Ok(());
             }
@@ -651,6 +843,35 @@ fn dispatch(shared: &Shared, frame: Frame) -> Result<()> {
             "YAS server sent an unsupported peer Request {:#06x}/{:#06x}",
             frame.header.family, frame.header.kind
         ))),
+    }
+}
+
+/// The Net datagram flows of a session, held weakly: a flow keeps its
+/// registry entry, never the session.
+#[derive(Clone)]
+pub(crate) struct Datagrams(std::sync::Weak<Shared>);
+
+impl Datagrams {
+    pub(crate) fn insert(&self, handle: u64, flow: Arc<crate::net::DatagramState>) {
+        if let Some(shared) = self.0.upgrade() {
+            if let Some(error) = shared.closed.borrow().clone() {
+                flow.fail(error);
+                return;
+            }
+            shared.datagrams.lock().unwrap().insert(handle, flow);
+        }
+    }
+
+    pub(crate) fn get(&self, handle: u64) -> Option<Arc<crate::net::DatagramState>> {
+        self.0
+            .upgrade()
+            .and_then(|shared| shared.datagrams.lock().unwrap().get(&handle).cloned())
+    }
+
+    pub(crate) fn remove(&self, handle: u64) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.datagrams.lock().unwrap().remove(&handle);
+        }
     }
 }
 
