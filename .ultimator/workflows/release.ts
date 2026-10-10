@@ -11,11 +11,20 @@
 //   refs/tags/v*, each declared by the job that publishes. Trusted publishing (OIDC) works from GitHub Actions only, so
 //   provenance is lost.
 import { checkout, download, upload, workflow, type Job } from "ultimator:ci";
-import { nix, packages, sh, windowsX64, type PackagesLabel } from "../lib/steps.ts";
+import {
+  nix,
+  packages,
+  sh,
+  windowsX64,
+  type PackagesLabel,
+} from "../lib/steps.ts";
 
 export default workflow({
   on: { tag: { patterns: ["v*"] } },
-  concurrency: (ctx) => ({ group: `release-${ctx.ref}`, cancelInProgress: false }),
+  concurrency: (ctx) => ({
+    group: `release-${ctx.ref}`,
+    cancelInProgress: false,
+  }),
   jobs: (ctx) => {
     const tag = ctx.tag ?? "";
     const version = tag.replace(/^v/, "");
@@ -49,22 +58,38 @@ export default workflow({
       ],
     };
     /** A sandbox job after the tag is verified: the repository, Nix, then its steps. */
-    const linux = (id: string, name: string, timeoutMinutes: number, steps: Job["steps"]): Job => ({
-      id, name, needs: [verify], runsOn: "sandbox", timeoutMinutes, steps: [checkout(), nix(), ...steps],
+    const linux = (
+      id: string,
+      name: string,
+      timeoutMinutes: number,
+      steps: Job["steps"],
+    ): Job => ({
+      id,
+      name,
+      needs: [verify],
+      runsOn: "sandbox",
+      timeoutMinutes,
+      steps: [checkout(), nix(), ...steps],
     });
     const platforms: { runner: string; label: PackagesLabel }[] = [
       { runner: "sandbox", label: "linux-x86_64" },
       { runner: "arm64-ci", label: "linux-aarch64" },
       { runner: "crab", label: "macos-aarch64" },
     ];
-    const tarballs = platforms.map(({ runner, label }): Job => ({
-      id: `packages-${label}`,
-      name: `Packages (${label})`,
-      needs: [verify],
-      runsOn: runner,
-      timeoutMinutes: 120,
-      steps: [checkout(), ...packages(label), upload({ name: `tarballs-${label}`, paths: ["dist/*.tar.gz"] })],
-    }));
+    const tarballs = platforms.map(
+      ({ runner, label }): Job => ({
+        id: `packages-${label}`,
+        name: `Packages (${label})`,
+        needs: [verify],
+        runsOn: runner,
+        timeoutMinutes: 120,
+        steps: [
+          checkout(),
+          ...packages(label),
+          upload({ name: `tarballs-${label}`, paths: ["dist/*.tar.gz"] }),
+        ],
+      }),
+    );
     const windows: Job = {
       id: "windows",
       name: "Windows (x86_64, emulated)",
@@ -97,11 +122,22 @@ export default workflow({
     // platform's release points at.
     const extensions = linux("extensions", "Extensions", 60, [
       { run: "./bin/extensions" },
-      upload({ name: "extensions", paths: ["extensions/dist/*.wasm", "extensions/dist/*.js", "extensions/dist/manifest.json"] }),
+      upload({
+        name: "extensions",
+        paths: [
+          "extensions/dist/*.wasm",
+          "extensions/dist/*.js",
+          "extensions/dist/manifest.json",
+        ],
+      }),
     ]);
     const fuzz = ["frame", "families", "packed"].map((target) =>
       linux(`protocol-fuzz-${target}`, `Protocol fuzz (${target})`, 90, [
-        { name: `Sustained YAS wire fuzz campaign (${target})`, env: { YAS_FUZZ_SECONDS: "3600", YAS_FUZZ_TARGET: target }, run: "./bin/fuzz" },
+        {
+          name: `Sustained YAS wire fuzz campaign (${target})`,
+          env: { YAS_FUZZ_SECONDS: "3600", YAS_FUZZ_TARGET: target },
+          run: "./bin/fuzz",
+        },
       ]),
     );
     const gathered = sh`
@@ -109,7 +145,10 @@ export default workflow({
       find downloaded -type f -exec cp {} artifacts/ \\;
     `;
     const built: Job[] = [
-      linux("lint", "Lint", 60, [{ run: "./bin/lint --check" }, { run: "./bin/publish-crates --plan" }]),
+      linux("lint", "Lint", 60, [
+        { run: "./bin/lint --check" },
+        { run: "./bin/publish-crates --plan" },
+      ]),
       linux("test", "Tests", 90, [{ run: "./bin/tests" }]),
       linux("e2e", "E2E", 90, [{ run: "./bin/e2e" }]),
       linux("coverage", "Coverage", 90, [{ run: "./bin/coverage" }]),
@@ -143,7 +182,11 @@ export default workflow({
             ls -lh
           `,
         },
-        upload({ name: `release-${tag}`, paths: ["release/*"], retentionDays: 90 }),
+        upload({
+          name: `release-${tag}`,
+          paths: ["release/*"],
+          retentionDays: 90,
+        }),
       ],
     };
     const npmrc = sh`
@@ -152,15 +195,30 @@ export default workflow({
       printf '//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}\\n' > "$NPM_CONFIG_USERCONFIG"
     `;
     /** A publishing job: after the release artifact, with the secret it publishes with. */
-    const publish = (id: string, name: string, timeoutMinutes: number, secret: string, steps: Job["steps"]): Job => ({
-      ...linux(id, name, timeoutMinutes, steps), needs: [release], secrets: [secret],
+    const publish = (
+      id: string,
+      name: string,
+      timeoutMinutes: number,
+      secret: string,
+      steps: Job["steps"],
+    ): Job => ({
+      ...linux(id, name, timeoutMinutes, steps),
+      needs: [release],
+      secrets: [secret],
     });
     return [
       verify,
       ...built,
       release,
-      publish("publish-crates", "crates.io", 60, "CARGO_REGISTRY_TOKEN", [{ run: "./bin/publish-crates" }]),
-      publish("publish-npm", "npm (packages)", 30, "NPM_TOKEN", [{ name: "Publish with a granular token", run: `${npmrc}./bin/publish-npm-packages --access public\n` }]),
+      publish("publish-crates", "crates.io", 60, "CARGO_REGISTRY_TOKEN", [
+        { run: "./bin/publish-crates" },
+      ]),
+      publish("publish-npm", "npm (packages)", 30, "NPM_TOKEN", [
+        {
+          name: "Publish with a granular token",
+          run: `${npmrc}./bin/publish-npm-packages --access public\n`,
+        },
+      ]),
       {
         id: "publish-bin-npm",
         name: "npm (binaries)",
@@ -172,9 +230,18 @@ export default workflow({
         steps: [
           checkout(),
           download({ pattern: "tarballs-*", path: "downloaded" }),
-          download({ name: "windows-x86_64", path: "downloaded/windows-x86_64" }),
-          { name: "Build YAS binary npm packages", run: `${gathered}./bin/build-npm-bin-packages artifacts dist/npm-bin "$VERSION"\n` },
-          { name: "Publish YAS binary npm packages with a granular token", run: `${npmrc}./bin/publish-npm-bin-packages dist/npm-bin --access public\n` },
+          download({
+            name: "windows-x86_64",
+            path: "downloaded/windows-x86_64",
+          }),
+          {
+            name: "Build YAS binary npm packages",
+            run: `${gathered}./bin/build-npm-bin-packages artifacts dist/npm-bin "$VERSION"\n`,
+          },
+          {
+            name: "Publish YAS binary npm packages with a granular token",
+            run: `${npmrc}./bin/publish-npm-bin-packages dist/npm-bin --access public\n`,
+          },
         ],
       },
     ];
