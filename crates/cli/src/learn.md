@@ -396,6 +396,14 @@ so `run`/`update` options go before the name. `--restart`, `--persist`,
 `--detach` and `--json` written after the module are refused rather than
 handed over; put a `--` first if the extension really wants one of them.
 
+An attached `run` prints the attempt's stdout, stderr, and log output, even
+when it finishes before the CLI starts following, and exits with the
+extension's return code. A trapped or failed attempt prints
+`yas: extension NAME trapped: DETAIL` to stderr and exits 1. A detached
+transient extension keeps its name for 30 s after it stops
+(`YAS_EXT_TERMINAL_RETAIN`) so its output can be replayed; `run` refuses to
+reuse that name until then and says so.
+
 `yas ext manage` opens an inline extension picker. Move with arrows or `j`/`k`
 and use Space or a mouse click to cycle the selected action: install for new
 extensions, update then uninstall for outdated ones, or uninstall for other
@@ -543,12 +551,17 @@ and `YAS_NET=0` govern it. The proxy ends with the process.
 
 ```bash
 yas clipboard list                            # list available MIME types
-yas clipboard get                             # read clipboard (text/plain)
+yas clipboard get                             # read clipboard as plain text
 yas clipboard get --mime image/png > shot.png # read specific MIME type
 yas clipboard set "hello"                     # set clipboard from argument
 echo "hello" | yas clipboard set              # set clipboard from stdin
 yas clipboard set --mime image/png < shot.png # set specific MIME type
 ```
+
+`set` offers text as `text/plain;charset=utf-8`. A plain-text `get`
+(`text/plain`, with or without a charset, or `UTF8_STRING`) reads whichever
+plain-text variant the owner offered, so set-then-get round-trips; other MIME
+types must match a listed type exactly.
 
 ## GUI surfaces
 
@@ -582,4 +595,11 @@ yas surface focus 1                                # give it keyboard/pointer fo
 yas surface record 1 --output video.h264           # record until Ctrl+C
 yas surface record 1 --duration 10 --output v.h264 # record 10 seconds
 yas surface record 1 --frames 30 --output v.h264   # record 30 frames
+yas surface record 1 --codec h264-444              # also announce H.264 4:4:4
 ```
+
+`record` without `--output` writes `surface-ID.h264`, or `surface-ID.obu` when
+the server picks AV1. `--codec h264-444`/`av1-444` announce 4:4:4 chroma; the
+server still falls back to 4:2:0 unless its `YAS_CHROMA` setting and encoder
+allow 4:4:4. `capture --scale` resizes the surface at that scale before
+capturing; there is no image quality setting.
