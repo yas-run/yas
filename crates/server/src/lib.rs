@@ -6052,7 +6052,7 @@ impl Session {
                             audio::unavailable_reason(
                                 desktop_bus_address.is_some(),
                                 &audio::missing_pipewire_binaries(),
-                                &audio_pw::load_error(),
+                                audio_pw::load_error(),
                             )
                         );
                     }
