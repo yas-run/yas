@@ -246,8 +246,9 @@
       # compositor is Linux-only).
       # ------------------------------------------------------------------
 
-      # Cargo feature flags for the GPL flavor: x264 instead of openh264.
-      gplFeatureArgs = "--no-default-features --features x264";
+      # Cargo feature flags for the GPL flavor: x264 instead of openh264 (and the
+      # browser UI and mimalloc, default features too).
+      gplFeatureArgs = "--no-default-features --features x264,ui,mimalloc";
 
       # Linux glibc binary — all deps statically linked, only glibc is
       # dynamic (so dlopen works for GPU).  Built with cargo-zigbuild
@@ -570,6 +571,8 @@
           website
           ;
         inherit pnpmDeps;
+        # The web UI's build; publish-crates packages it into yas-edge.
+        yas-ui = webAppDist;
         default = yas;
       }
       // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

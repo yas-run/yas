@@ -244,6 +244,27 @@ Surfaces created by the terminal appear in the connection's `surfaceStore`, keye
 - `setVisibleSessions(sessionIds)`
 - `addConnection(...)` / `removeConnection(connectionId)` / `reconnectConnection(connectionId)`
 
+### Client identifiers
+
+A connection can report an identifier of your choosing (a user, a device, your
+app's own session ID) to name it in the server's client list: `yas client
+list`, and Manage → Clients in the browser. That list shows each client's
+terminal and surface view sizes, and a shared terminal or window is sized to
+fit the smallest, so the identifier is how to tell whose view that is. YAS
+passes it on as is: it must be UTF-8 of at most 1 KiB and nothing else is
+checked, and several clients may report the same one.
+
+```ts
+new YasWorkspace({
+  wasm,
+  connections: [{ id: "default", transport, clientIdentifier: "alice@laptop" }],
+});
+```
+
+On a `YasConnection` of your own, pass `clientIdentifier` in its options, and
+call `updateClientIdentifier(text)` to replace it on the live session. The Rust
+client takes `HelloOptions::identifier` and `Client::set_identifier`.
+
 ### Transports
 
 All transports share a common set of options (`YasTransportOptions`):
@@ -352,6 +373,14 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   compositor. List them, capture one as PNG or AVIF, click, scroll, press keys
   (`key_combo("ctrl+c")`, `typed_keys("hello{enter}")`) or enter text,
   resize, focus and close them: `yas surface`, for programs that drive GUIs.
+- **Network** (`net`): `client.net()?.open_tcp(host, port)` opens a TCP
+  connection from the server and returns a `NetStream`, Tokio
+  `AsyncRead + AsyncWrite` with half-close and credit both ways; any number
+  share the session. `open_udp` relays whole datagrams. A refused open says
+  why with `Error::net_failure()` (`Denied` by the server's
+  `--allow-forward` policy, `NotFound`, `Refused`, `Timeout`). A server run
+  with `--net-only --allow-forward host:port` offers this and nothing else
+  ([docs/server.md](docs/server.md#net-only-servers)).
 - **Errors** (`Error`): connection failures, lost sessions, server statuses
   (`is_not_found`, `is_conflict`), timeouts, unsupported operations,
   protocol violations.
@@ -383,7 +412,52 @@ println!("{} {}", output.status, String::from_utf8_lossy(&output.stdout));
   ([docs/transports.md](docs/transports.md#read-only-socket)).
 
 `cargo run -p yas-client --example run -- local -- uname -a` is a complete
-example; `crates/cli/tests/client_host.rs` exercises the API end to end.
+example; `crates/cli/tests/client_host.rs` and `client_net.rs` exercise the
+API end to end.
+
+## Rust: the whole CLI, `yas-cli`
+
+A program can carry the `yas` CLI itself, as a subcommand of its own or under
+the name `yas` (a link, or a copy so named), so one binary is both:
+
+```toml
+yas-cli = { path = "../yas/crates/cli", default-features = false, features = ["openh264"] }
+```
+
+```rust
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "yas") {
+        let program = std::env::current_exe().unwrap();
+        let invocation = yas_cli::Invocation {
+            program,
+            args: vec!["yas".into()],
+            part_of: Some("myapp".into()),
+        };
+        yas_cli::run(invocation, std::iter::once("yas".into()).chain(args[2..].iter().cloned()));
+        return;
+    }
+    // … the program's own commands
+}
+```
+
+- `yas_cli::run(invocation, args)` runs the CLI on `args` (the program's name
+  first) and returns once the command is done, or exits the process. Call it
+  first in `main`, before any thread starts (it bounds glibc's malloc arenas)
+  and before a rustls crypto provider is installed (it installs ring's when
+  none is).
+- `Invocation` says how the CLI runs itself again: the local server a client
+  starts when none answers, the proxy daemon, `yas share`'s. It runs `program`
+  with `args` before the subcommand (`myapp yas server …`); for a binary named
+  `yas`, `args` is empty.
+- `part_of` names the program that brings this YAS: `yas upgrade` then fails
+  with "this yas is part of myapp: upgrade myapp instead".
+- Without the `ui` feature (a default one), the browser UI that `yas edge`
+  serves and a bare `yas` opens is a page saying this build carries none, and
+  the build needs no `js/ui/dist`.
+  `openh264` and `x264` are the CLI's video encoders, as for `yas` itself;
+  `mimalloc` (default too) is the `yas` binary's allocator, which a program
+  that carries the CLI leaves out and picks its own.
 
 ## Server-side: a Node/Bun client over a unix socket
 

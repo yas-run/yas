@@ -514,6 +514,7 @@ import {
   transfersFor,
   type YasConnectionOptions,
   type YasFontFace,
+  type YasRequestFailure,
   type YasRelayRoute,
   type YasTransport,
   type YasTransferDescriptor,
@@ -1752,6 +1753,15 @@ describe("YAS v1", () => {
     matches("fs.conflict_detail.payload", encodeFsConflictDetail(fsConflict));
     const fsApply = decodeFsApply(fromHex(vector("fs.apply.payload")));
     matches("fs.apply.payload", encodeFsApply(fsApply));
+    const fsApplyInPlace = decodeFsApply(
+      fromHex(vector("fs.apply.in_place.payload")),
+    );
+    expect(fsApplyInPlace.items[0]).toMatchObject({
+      kind: "write-inline",
+      inPlace: true,
+      createParents: false,
+    });
+    matches("fs.apply.in_place.payload", encodeFsApply(fsApplyInPlace));
     const fsApplyResult = decodeFsApplyResult(
       fromHex(vector("fs.apply_result.payload")),
     );
@@ -4573,6 +4583,63 @@ describe("YAS v1", () => {
     transport.setStatus("disconnected");
 
     expect(abortObserved).toBe(true);
+  });
+
+  it("reports every rejected Request to failure listeners", async () => {
+    const { transport, connection } = await connected();
+    const failures: YasRequestFailure[] = [];
+    connection.onRequestFailure((failure) => failures.push(failure));
+    const rejection = (promise: Promise<unknown>) =>
+      promise.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+    const refused = rejection(
+      connection.request(YAS_FAMILY_CORE, YAS_CORE_PING, new Uint8Array()),
+    );
+    const request = lastRequest(transport);
+    transport.push(
+      encodeYasFrame({
+        family: request.family,
+        kind: request.kind,
+        class: YAS_CLASS_RESULT,
+        requestId: request.requestId,
+        payload: encodeResultPayload(YAS_STATUS_INVALID, new Uint8Array()),
+      }),
+    );
+    const unadvertised = rejection(
+      connection.request(YAS_FAMILY_RELAY, 0x7fff),
+    );
+    const lost = rejection(
+      connection.request(YAS_FAMILY_CORE, YAS_CORE_PING, new Uint8Array()),
+    );
+    transport.setStatus("disconnected");
+
+    expect(failures).toEqual([
+      { family: YAS_FAMILY_CORE, kind: YAS_CORE_PING, error: await refused },
+      { family: YAS_FAMILY_RELAY, kind: 0x7fff, error: await unadvertised },
+      { family: YAS_FAMILY_CORE, kind: YAS_CORE_PING, error: await lost },
+    ]);
+    expect(failures[0]?.error).toMatchObject({ status: YAS_STATUS_INVALID });
+  });
+
+  it("reports a send failure that fails the session once", async () => {
+    const { transport, connection } = await connected();
+    const failures: YasRequestFailure[] = [];
+    connection.onRequestFailure((failure) => failures.push(failure));
+    transport.send = () => {
+      transport.setStatus("error");
+      throw new Error("edge write failed");
+    };
+
+    const error = await connection
+      .request(YAS_FAMILY_CORE, YAS_CORE_PING, new Uint8Array())
+      .catch((rejection: unknown) => rejection);
+
+    expect(failures).toEqual([
+      { family: YAS_FAMILY_CORE, kind: YAS_CORE_PING, error },
+    ]);
   });
 
   it("preserves a synchronous send failure through transport close status", async () => {

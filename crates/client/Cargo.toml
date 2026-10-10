@@ -1,8 +1,8 @@
 [package]
 name = "yas-client"
-version = "0.3.1"
+version = "0.5.1"
 edition.workspace = true
-description = "Rust client for YAS servers: processes, files, terminals, surfaces, KV"
+description = "Rust client for YAS servers: processes, files, terminals, surfaces, KV, network streams"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

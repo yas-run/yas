@@ -5,6 +5,7 @@ import type {
 } from "../types.js";
 import {
   YAS_CORE_CANCEL,
+  YAS_CORE_CLIENT_UPDATE,
   YAS_CORE_FAMILY_UPDATE,
   YAS_CORE_GOAWAY,
   YAS_CORE_HELLO,
@@ -24,8 +25,10 @@ import {
   decodeServerHello,
   decodeSessionUpdate,
   decodeSessionInfo,
+  clientIdentifierExtension,
   encodeCancel,
   encodeClientHello,
+  encodeClientUpdate,
   encodePing,
   encodePingResult,
   encodeShutdown,
@@ -145,6 +148,15 @@ export interface YasCatalogChange {
 }
 
 type CatalogChangeListener = (change: YasCatalogChange) => void;
+
+/** A Request whose promise rejected, reported before the caller sees it. */
+export interface YasRequestFailure {
+  family: number;
+  kind: number;
+  error: unknown;
+}
+
+type RequestFailureListener = (failure: YasRequestFailure) => void;
 
 interface PendingRequest {
   family: number;
@@ -323,6 +335,7 @@ export class YasConnection {
   private readonly invalidationListeners = new Set<InvalidationListener>();
   private readonly readyListeners = new Set<ReadyListener>();
   private readonly catalogChangeListeners = new Set<CatalogChangeListener>();
+  private readonly requestFailureListeners = new Set<RequestFailureListener>();
   private readonly familyLimitValidators = new Map<
     number,
     (limits: readonly YasExtension[]) => void
@@ -359,6 +372,9 @@ export class YasConnection {
     readonly transport: YasTransport,
     options: YasConnectionOptions = {},
   ) {
+    // Refused here: thrown while encoding HELLO, it would stall the handshake.
+    if (options.clientIdentifier !== undefined)
+      clientIdentifierExtension(options.clientIdentifier);
     const clientInstance = options.clientInstance ?? randomUuidBytes();
     this.requestedReceiveMaxDatagram = options.receiveMaxDatagram;
     this.options = {
@@ -514,12 +530,16 @@ export class YasConnection {
     sensitive?: boolean,
   ): Promise<Uint8Array> {
     if (!this.ready)
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasDisconnectedError("YAS session is not ready"),
       );
     this.family(family);
     if (!this.operationAdvertised(family, YAS_CLASS_REQUEST, kind))
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasResultError(
           YAS_STATUS_UNSUPPORTED,
           new Uint8Array(0),
@@ -541,12 +561,16 @@ export class YasConnection {
     sensitive?: boolean,
   ): Promise<YasResultEnvelope> {
     if (!this.ready)
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasDisconnectedError("YAS session is not ready"),
       );
     this.family(family);
     if (!this.operationAdvertised(family, YAS_CLASS_REQUEST, kind))
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasResultError(
           YAS_STATUS_UNSUPPORTED,
           new Uint8Array(0),
@@ -565,12 +589,16 @@ export class YasConnection {
     sensitive?: boolean,
   ): Promise<T> {
     if (!this.ready)
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasDisconnectedError("YAS session is not ready"),
       );
     this.family(family);
     if (!this.operationAdvertised(family, YAS_CLASS_REQUEST, kind))
-      return Promise.reject(
+      return this.rejectRequest(
+        family,
+        kind,
         new YasResultError(
           YAS_STATUS_UNSUPPORTED,
           new Uint8Array(0),
@@ -677,6 +705,19 @@ export class YasConnection {
     return () => this.readyListeners.delete(listener);
   }
 
+  /**
+   * Observe every Request whose promise rejects: a non-OK Result, a Result
+   * body that failed to decode, a Request the server does not advertise, a
+   * frame that could not be written, or a session lost with the Request in
+   * flight. Runs synchronously before the rejection reaches the caller. A
+   * non-OK status returned through {@link requestResult} resolves and is not
+   * reported.
+   */
+  onRequestFailure(listener: RequestFailureListener): () => void {
+    this.requestFailureListeners.add(listener);
+    return () => this.requestFailureListeners.delete(listener);
+  }
+
   /** Observe applied FAMILY_UPDATE and SESSION_INFO catalogue replacements. */
   onCatalogChange(listener: CatalogChangeListener): () => void {
     this.catalogChangeListeners.add(listener);
@@ -710,6 +751,19 @@ export class YasConnection {
     return decodeSessionInfo(
       await this.request(YAS_FAMILY_CORE, YAS_CORE_SESSION_INFO),
     );
+  }
+
+  /**
+   * Replace the identifier this session reported in HELLO
+   * ({@link YasClientHelloOptions.clientIdentifier}) with Core CLIENT_UPDATE.
+   * Client catalogue watchers see it at their next refresh. The next HELLO,
+   * after a reconnect, reports it too, even when this Request fails.
+   */
+  async updateClientIdentifier(identifier: string): Promise<void> {
+    // Encoded first: one too long to report throws before it is kept.
+    const update = encodeClientUpdate({ clientIdentifier: identifier });
+    this.options.clientIdentifier = identifier;
+    await this.request(YAS_FAMILY_CORE, YAS_CORE_CLIENT_UPDATE, update);
   }
 
   async cancel(targetRequestId: number): Promise<void> {
@@ -803,13 +857,13 @@ export class YasConnection {
     const requestId = this.allocateRequestId();
     let rejectPromise!: (error: unknown) => void;
     const promise = new Promise<T>((resolve, reject) => {
-      rejectPromise = reject;
+      rejectPromise = this.reportingRejection(family, kind, reject);
       this.pending.set(requestId, {
         family,
         kind,
         decode,
         resolve: resolve as (value: unknown) => void,
-        reject,
+        reject: rejectPromise,
       });
     });
     try {
@@ -840,13 +894,13 @@ export class YasConnection {
     const requestId = this.allocateRequestId();
     let rejectPromise!: (error: unknown) => void;
     const promise = new Promise<YasResultEnvelope>((resolve, reject) => {
-      rejectPromise = reject;
+      rejectPromise = this.reportingRejection(family, kind, reject);
       this.pending.set(requestId, {
         family,
         kind,
         preserveResult: true,
         resolve: resolve as (value: unknown) => void,
-        reject,
+        reject: rejectPromise,
       });
     });
     try {
@@ -1434,6 +1488,41 @@ export class YasConnection {
       listener(hello);
     } catch (error) {
       this.reportListenerError("ready", error);
+    }
+  }
+
+  private rejectRequest<T>(
+    family: number,
+    kind: number,
+    error: unknown,
+  ): Promise<T> {
+    this.emitRequestFailure({ family, kind, error });
+    return Promise.reject(error);
+  }
+
+  private reportingRejection(
+    family: number,
+    kind: number,
+    reject: (error: unknown) => void,
+  ): (error: unknown) => void {
+    let rejected = false;
+    return (error) => {
+      // A send that fails the session rejects the Request there first; the
+      // send error that follows never reaches the caller.
+      if (rejected) return;
+      rejected = true;
+      this.emitRequestFailure({ family, kind, error });
+      reject(error);
+    };
+  }
+
+  private emitRequestFailure(failure: YasRequestFailure): void {
+    for (const listener of [...this.requestFailureListeners]) {
+      try {
+        listener(failure);
+      } catch (error) {
+        this.reportListenerError("request failure", error);
+      }
     }
   }
 
