@@ -2072,7 +2072,7 @@ async fn serve_registered<S>(
         )
     });
     let native_active_subscriptions = Arc::new(NativeYasSubscriptions::default());
-    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel(1);
+    let (native_disconnect_tx, mut native_disconnect_rx) = mpsc::channel::<String>(1);
     let native_client_registered = registration.is_some() && services.app_state.is_some();
     #[cfg(target_os = "linux")]
     let mut native_backend_owner = None;
@@ -2630,10 +2630,10 @@ async fn serve_registered<S>(
                     None => break 'session "native Channel terminal event channel closed".to_owned(),
                 },
                 disconnect = native_disconnect_rx.recv(), if native_client_registered => {
-                    if disconnect.is_none() {
+                    let Some(reason) = disconnect else {
                         break 'session "native client disconnect channel closed".to_owned();
-                    }
-                    if session.send_client_goaway().await.is_err() {
+                    };
+                    if session.send_client_goaway(&reason).await.is_err() {
                         break 'session "native client disconnect requested; GOAWAY failed".to_owned();
                     }
                     break 'session "native client disconnect requested; GOAWAY sent".to_owned();
@@ -7364,11 +7364,11 @@ impl Session {
         Ok(())
     }
 
-    async fn send_client_goaway(&self) -> Result<(), ()> {
+    async fn send_client_goaway(&self, reason: &str) -> Result<(), ()> {
         let payload = GoAway {
             status: Status::Ok,
             close_deadline_server_ns: monotonic_ns(),
-            detail: Extensions::default(),
+            detail: GoAway::reason_detail(reason),
         }
         .encode()
         .map_err(|_| ())?;
@@ -8750,7 +8750,7 @@ impl Session {
         self.send_sensitive_result_confirmed(&frame, status, Vec::new())
             .await?;
         if let Some(disconnect) = target {
-            let _ = disconnect.send(()).await;
+            let _ = disconnect.send(request.reason).await;
         }
         Ok(())
     }
@@ -12835,7 +12835,11 @@ impl Session {
         #[cfg(target_os = "linux")]
         let subscribed = if let Some(state) = self.services.app_state.as_ref() {
             let mut shared = state.session.lock().await;
-            if let Some(compositor) = shared.compositor.as_mut() {
+            if let Some(compositor) = shared
+                .compositor
+                .as_mut()
+                .filter(|compositor| compositor.audio_output_enabled)
+            {
                 compositor.audio_broadcast.subscribe_native(
                     backend_owner,
                     request.target_bitrate_kbps,
@@ -12843,11 +12847,10 @@ impl Session {
                 );
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                 }
                 true
             } else {
@@ -26504,11 +26507,10 @@ impl Session {
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                     // Publish even when the remaining current maximum is
                     // zero: the removed report may have expired before the
                     // maintenance tick cleared its advertised latency.
@@ -28609,11 +28611,10 @@ impl Session {
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
-                    pipeline.set_bitrate(if max_kbps == 0 {
-                        super::audio::DEFAULT_BITRATE
-                    } else {
-                        i32::from(max_kbps) * 1_000
-                    });
+                    pipeline.set_bitrate(super::audio::output_bitrate(
+                        max_kbps,
+                        compositor.audio_bitrate,
+                    ));
                     // Publish even when the remaining current maximum is
                     // zero: the removed report may have expired before the
                     // maintenance tick cleared its advertised latency.
@@ -33917,7 +33918,7 @@ fn rebuild_media_devices(runtime: &mut MediaRuntime) -> bool {
         old.get(&MEDIA_OUTPUT_DEVICE_HANDLE),
         MEDIA_OUTPUT_DEVICE_HANDLE,
         yas_wire::schema::media::KIND_AUDIO_OUTPUT as u8,
-        backend.is_some_and(|state| state.pipewire_available),
+        backend.is_some_and(|state| state.audio_output_available),
         "Default audio output",
         vec![media_audio_format(
             yas_wire::schema::media::CODEC_OPUS as u16,
@@ -41962,7 +41963,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .native_media_state_override = Some(super::super::MediaBackendState {
-                pipewire_available: true,
+                audio_output_available: true,
                 microphone_available: false,
                 camera_available: false,
                 screencasts: Vec::new(),
@@ -48498,7 +48499,7 @@ mod tests {
             let compositor = shared.compositor.as_mut().unwrap();
             compositor.audio_broadcast = super::super::audio::AudioBroadcast::new();
             compositor.native_media_state_override = Some(super::super::MediaBackendState {
-                pipewire_available: true,
+                audio_output_available: true,
                 microphone_available: false,
                 camera_available: false,
                 screencasts: Vec::new(),
