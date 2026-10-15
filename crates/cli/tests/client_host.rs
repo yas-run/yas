@@ -22,10 +22,11 @@ fn options() -> HostOptions {
 
 fn options_for(binary: impl Into<std::path::PathBuf>) -> HostOptions {
     // The servers these tests host are defaults: none of the YAS variables this test process runs with (a CI
-    // machine's YAS_PROCESS_* maxima, its YAS_TARGET) configure them.
+    // machine's YAS_PROCESS_* maxima, its YAS_TARGET) configure them. HostOptions sets YAS_SKIP_COMPOSITOR and
+    // YAS_RELAY itself, before these removals apply: removing them would start a compositor or the relay.
     let mut options = HostOptions::new(binary);
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("YAS_") {
+        if inherited_yas_variable(&key.to_string_lossy()) {
             options = options.env_remove(key);
         }
     }
@@ -36,6 +37,21 @@ fn options_for(binary: impl Into<std::path::PathBuf>) -> HostOptions {
         .env("YAS_FONTS", "0")
         .env("YAS_AUDIO", "0")
         .env("YAS_CLIENT_TEST_VARIABLE", "forty-two")
+}
+
+/// A YAS variable of this test process that its hosted servers must not inherit: every `YAS_*` but those
+/// [`HostOptions`] sets for them.
+fn inherited_yas_variable(key: &str) -> bool {
+    key.starts_with("YAS_") && !matches!(key, "YAS_SKIP_COMPOSITOR" | "YAS_RELAY")
+}
+
+#[test]
+fn hosted_servers_drop_inherited_yas_variables_but_keep_the_hosts_defaults() {
+    assert!(inherited_yas_variable("YAS_PROCESS_MAX_PER_SESSION"));
+    assert!(inherited_yas_variable("YAS_TARGET"));
+    assert!(!inherited_yas_variable("YAS_SKIP_COMPOSITOR"));
+    assert!(!inherited_yas_variable("YAS_RELAY"));
+    assert!(!inherited_yas_variable("PATH"));
 }
 
 async fn start() -> HostedServer {
