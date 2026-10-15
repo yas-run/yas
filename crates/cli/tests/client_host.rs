@@ -21,7 +21,15 @@ fn options() -> HostOptions {
 }
 
 fn options_for(binary: impl Into<std::path::PathBuf>) -> HostOptions {
-    HostOptions::new(binary)
+    // The servers these tests host are defaults: none of the YAS variables this test process runs with (a CI
+    // machine's YAS_PROCESS_* maxima, its YAS_TARGET) configure them.
+    let mut options = HostOptions::new(binary);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("YAS_") {
+            options = options.env_remove(key);
+        }
+    }
+    options
         .arg("--no-persistent-extensions")
         .env("YAS_EXT", "0")
         .env("YAS_CHANNEL", "0")
