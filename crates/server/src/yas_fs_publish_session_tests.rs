@@ -259,3 +259,61 @@ async fn nondurable_publish_result_is_replayed_exactly_without_retrying_publicat
     }
     assert_eq!(fs::read_dir(fixture.directory.path()).unwrap().count(), 0);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fresh_open_does_not_reuse_a_directory_replaced_at_the_same_path() {
+    let runtime = runtime();
+    let base = tempfile::tempdir().unwrap();
+    let current = base.path().join("work");
+    let old = base.path().join("work-old");
+    fs::create_dir(&current).unwrap();
+    fs::write(current.join("source"), b"same bytes").unwrap();
+    let first = runtime.session([81; 16]).unwrap();
+    let open = || wire::Open {
+        source: wire::RootSource::PlatformPath(os_path_bytes(&current)),
+        flags: 0,
+        extensions: Extensions::default(),
+    };
+    let a = first.open(&open()).await.unwrap();
+    fs::rename(&current, &old).unwrap();
+    fs::create_dir(&current).unwrap();
+    fs::write(current.join("source"), b"same bytes").unwrap();
+    let second = runtime.session([82; 16]).unwrap();
+    let b = second.open(&open()).await.unwrap();
+    assert_ne!(a.root_handle, b.root_handle);
+    let request = |root_handle, operation_id| wire::Publish {
+        root_handle,
+        source: path(b"source"),
+        destination: path(b"destination"),
+        precondition: wire::Precondition::Absent,
+        operation_id,
+        byte_len: 10,
+        content_hash: *blake3::hash(b"same bytes").as_bytes(),
+        extensions: Extensions::default(),
+    };
+    assert!(
+        second
+            .publish(&request(b.root_handle, [83; 16]))
+            .await
+            .unwrap()
+            .durable
+    );
+    assert_eq!(
+        fs::read(current.join("destination")).unwrap(),
+        b"same bytes"
+    );
+    assert!(!old.join("destination").exists());
+    // Existing handles still retain the original authorized directory identity.
+    assert!(
+        first
+            .publish(&request(a.root_handle, [84; 16]))
+            .await
+            .unwrap()
+            .durable
+    );
+    assert_eq!(fs::read(old.join("destination")).unwrap(), b"same bytes");
+    // A later OPEN of the unchanged current directory can reuse its actual identity.
+    let again = second.open(&open()).await.unwrap();
+    assert_eq!(again.root_handle, b.root_handle);
+}

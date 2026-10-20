@@ -15,7 +15,7 @@ fn open_at(parent: &File, name: &CStr, flags: i32, mode: libc::mode_t) -> io::Re
             parent.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_CLOEXEC,
-            mode,
+            mode as libc::c_uint,
         )
     };
     if fd < 0 {

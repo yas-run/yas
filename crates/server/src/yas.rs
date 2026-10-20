@@ -50679,6 +50679,7 @@ mod tests {
             yas_wire::schema::fs::request::GREP,
             yas_wire::schema::fs::request::COMMIT,
             yas_wire::schema::fs::request::APPLY,
+            yas_wire::schema::fs::request::PUBLISH,
         ]);
         let metadata = yas_wire::schema::family_metadata(family::FS, 1).expect("FS metadata");
         let mut seen_semantic = BTreeSet::new();

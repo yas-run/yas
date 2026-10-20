@@ -179,6 +179,7 @@ pub(crate) enum Error {
     Permission,
     Conflict(wire::ConflictDetail),
     /// A conflict for which observing the current destination would itself be unsafe/unbounded.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "native PUBLISH is Unix-only"))]
     PreconditionFailed,
     ResourceExhausted,
     TooLarge,
@@ -316,17 +317,36 @@ impl Runtime {
     fn root(&self, path: PathBuf) -> Result<Arc<Root>, Error> {
         let mut roots = self.inner.roots.lock().unwrap();
         roots.retain(|_, root| root.strong_count() != 0);
+        let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
+        #[cfg(unix)]
+        let publication_dir = publication_directory(&path);
         if let Some(root) = roots.get(&path).and_then(Weak::upgrade) {
-            return Ok(root);
+            #[cfg(unix)]
+            let same = match (&root.publication_dir, &publication_dir) {
+                (Some(previous), Some(current)) => {
+                    use std::os::unix::fs::MetadataExt;
+                    previous
+                        .metadata()
+                        .ok()
+                        .zip(current.metadata().ok())
+                        .is_some_and(|(a, b)| (a.dev(), a.ino()) == (b.dev(), b.ino()))
+                }
+                // An unpinned root cannot prove identity for a fresh admission.
+                _ => false,
+            };
+            #[cfg(not(unix))]
+            let same = true;
+            if same {
+                return Ok(root);
+            }
         }
         let handle = next_nonzero(&self.inner.next_root).ok_or(Error::ResourceExhausted)?;
-        let metadata = fs::symlink_metadata(&path).map_err(os_io("lstat"))?;
         let root = Arc::new(Root {
             handle,
             canonical_path: os_path_bytes(&path),
             single_file: !metadata.is_dir(),
             #[cfg(unix)]
-            publication_dir: publication_directory(&path),
+            publication_dir,
             path: path.clone(),
             revision: AtomicU64::new(1),
             entries: StdMutex::new(BTreeMap::new()),
