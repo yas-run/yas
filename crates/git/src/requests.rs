@@ -303,8 +303,12 @@ fn resolve_one(
             .map_err(|_| GIT_STATUS_WRONG_TYPE)
     };
     // Commit oids of an object's parents (for the `^@` / `^!` forms).
+    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
     let parents = |id: gix::ObjectId| -> Result<Vec<gix::ObjectId>, u8> {
         let c = commit(id)?;
+        if is_shallow(shallow.as_ref(), &c) {
+            return Ok(Vec::new());
+        }
         Ok(repo
             .find_commit(c)
             .map_err(|_| GIT_STATUS_NOT_FOUND)?
@@ -380,10 +384,18 @@ const BASE_P2: u8 = 2;
 const BASE_STALE: u8 = 4;
 const BASE_RESULT: u8 = 8;
 
+/// Whether `id` is a shallow boundary commit. Git treats one as a root,
+/// whatever parents its object names: they are not part of the history this
+/// repository has, and usually not in it at all.
+fn is_shallow(shallow: Option<&gix::shallow::Commits>, id: &gix::ObjectId) -> bool {
+    shallow.is_some_and(|commits| commits.binary_search(id).is_ok())
+}
+
 /// The `(commit time, parents)` of a commit, memoized — the paint walk
 /// touches a commit once for its time and once for its parents.
 fn commit_info(
     repo: &gix::Repository,
+    shallow: Option<&gix::shallow::Commits>,
     cache: &mut std::collections::HashMap<gix::ObjectId, (i64, Vec<gix::ObjectId>)>,
     id: gix::ObjectId,
 ) -> Result<(i64, Vec<gix::ObjectId>), u8> {
@@ -392,7 +404,11 @@ fn commit_info(
     }
     let commit = repo.find_commit(id).map_err(|_| GIT_STATUS_OTHER)?;
     let time = commit.time().map(|t| t.seconds).unwrap_or(0);
-    let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    let parents: Vec<gix::ObjectId> = if is_shallow(shallow, &id) {
+        Vec::new()
+    } else {
+        commit.parent_ids().map(|p| p.detach()).collect()
+    };
     cache.insert(id, (time, parents.clone()));
     Ok((time, parents))
 }
@@ -425,9 +441,11 @@ fn paint_bases(
     let mut counted: std::collections::HashMap<gix::ObjectId, usize> = Default::default();
     let mut live = 0usize;
     let mut results: Vec<gix::ObjectId> = Vec::new();
+    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
+    let shallow = shallow.as_ref();
 
     for (id, flag) in [(a, BASE_P1), (b, BASE_P2)] {
-        let (time, _) = commit_info(repo, &mut info, id)?;
+        let (time, _) = commit_info(repo, shallow, &mut info, id)?;
         flags.insert(id, flag);
         heap.push((time, id));
         *counted.entry(id).or_default() += 1;
@@ -459,7 +477,7 @@ fn paint_bases(
             }
             pass |= BASE_STALE;
         }
-        let (_, parents) = commit_info(repo, &mut info, id)?;
+        let (_, parents) = commit_info(repo, shallow, &mut info, id)?;
         for parent in parents {
             let entry = flags.entry(parent).or_insert(0);
             if *entry & pass == pass {
@@ -471,7 +489,7 @@ fn paint_bases(
             if now_stale && !was_stale {
                 live -= counted.remove(&parent).unwrap_or(0);
             }
-            let (time, _) = commit_info(repo, &mut info, parent)?;
+            let (time, _) = commit_info(repo, shallow, &mut info, parent)?;
             heap.push((time, parent));
             if !now_stale {
                 *counted.entry(parent).or_default() += 1;
@@ -542,12 +560,17 @@ pub(crate) fn bounded_merge_bases(
     cancel: &Cancel,
 ) -> Result<Vec<gix::ObjectId>, u8> {
     let key = if a <= b { (a, b) } else { (b, a) };
-    if let Some(bases) = memo.get(&key) {
+    // Deepening moves a shallow boundary under the same oids, so an answer
+    // it cut short is not one to keep.
+    let memoize = !repo.is_shallow();
+    if memoize && let Some(bases) = memo.get(&key) {
         return Ok(bases);
     }
     let candidates = paint_bases(repo, a, b, budget, cancel)?;
     let bases = reduce_bases(repo, candidates, budget, cancel)?;
-    memo.put(key, bases.clone());
+    if memoize {
+        memo.put(key, bases.clone());
+    }
     Ok(bases)
 }
 
@@ -590,6 +613,8 @@ pub(crate) fn walk_log(
         }
     }
 
+    let shallow = repo.shallow_commits().map_err(|_| GIT_STATUS_OTHER)?;
+    let shallow = shallow.as_ref();
     let mut walk = repo.rev_walk(tips);
     if flags & GIT_LOG_FIRST_PARENT != 0 {
         walk = walk.first_parent_only();
@@ -647,7 +672,11 @@ pub(crate) fn walk_log(
             more = true;
             break;
         }
-        let parents: Vec<gix::ObjectId> = info.parent_ids.iter().copied().collect();
+        let parents: Vec<gix::ObjectId> = if is_shallow(shallow, &info.id) {
+            Vec::new()
+        } else {
+            info.parent_ids.iter().copied().collect()
+        };
         visited_set.insert(info.id);
         for parent in &parents {
             if parent_set.insert(*parent) {
@@ -754,7 +783,8 @@ pub(crate) fn walk_log(
         let Ok(commit) = repo.find_commit(matched.id) else {
             return Err(GIT_STATUS_OTHER);
         };
-        if !append_commit(repo, &commit, flags, &mut records) {
+        let shallow_root = is_shallow(shallow, &matched.id);
+        if !append_commit(repo, &commit, shallow_root, flags, &mut records) {
             return Err(GIT_STATUS_OTHER);
         }
         if flags & GIT_LOG_PATH_OIDS != 0
@@ -886,6 +916,7 @@ fn find_blob_path(
 fn append_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
+    shallow_root: bool,
     req_flags: u8,
     records: &mut Vec<OwnedGitCommitRecord>,
 ) -> bool {
@@ -924,10 +955,14 @@ fn append_commit(
             flags: if lossy { GIT_COMMIT_LOSSY_ENCODING } else { 0 },
             oid: oid_bytes(commit.id().as_ref()),
             tree: oid_bytes(commit_ref.tree().as_ref()),
-            parents: commit_ref
-                .parents()
-                .map(|p| oid_bytes(p.as_ref()))
-                .collect(),
+            parents: if shallow_root {
+                Vec::new()
+            } else {
+                commit_ref
+                    .parents()
+                    .map(|p| oid_bytes(p.as_ref()))
+                    .collect()
+            },
             author_time,
             author_tz,
             committer_time,
