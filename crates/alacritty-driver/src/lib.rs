@@ -780,13 +780,17 @@ impl TerminalDriver {
     /// next. `c0`/`c1` are inclusive column bounds, already clamped.
     ///
     /// A soft-wrapped row keeps its trailing space: it's the gap between
-    /// words ("for all", not "forall").
+    /// words ("for all", not "forall"). The padding cell left when a wide
+    /// char wraps early is not text and is dropped ("뚝섬", not "뚝 섬").
     fn row_text(&self, line: Line, c0: usize, c1: usize) -> (String, bool) {
         let grid_row = &self.term.grid()[line];
         let mut text = String::new();
         for col_idx in c0..=c1 {
             let cell = &grid_row[Column(col_idx)];
-            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+            if cell
+                .flags
+                .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER)
+            {
                 continue;
             }
             let c = if cell.c == '\0' { ' ' } else { cell.c };
@@ -1894,6 +1898,21 @@ mod integration_tests {
         assert_eq!(
             text, "abcdefghi jkl",
             "wrapped selection must preserve the boundary space, got {text:?}"
+        );
+    }
+
+    /// Regression: a wide char that doesn't fit in the last column wraps and
+    /// leaves a LEADING_WIDE_CHAR_SPACER there; copying must not turn that
+    /// padding into a space ("뚝섬" -> "뚝 섬").
+    #[test]
+    fn wide_char_wrap_does_not_insert_space_get_text_range() {
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        driver.process("abcdefghi뚝섬".as_bytes());
+
+        let text = driver.get_text_range(23, 0, 22, 9);
+        assert_eq!(
+            text, "abcdefghi뚝섬",
+            "wide-char wrap padding must not be copied, got {text:?}"
         );
     }
 }
